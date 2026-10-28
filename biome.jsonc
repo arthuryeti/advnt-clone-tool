@@ -1,0 +1,120 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": {
+          "level": "on",
+          "options": {
+            "groups": [":NODE:", ":PACKAGE:", ["@/**"]]
+          }
+        }
+      }
+    }
+  },
+  "files": {
+    "includes": [
+      "**",
+      "!app/globals.css",
+      "!**/node_modules",
+      "!**/dist",
+      "!**/.next",
+      "!**/build",
+      "!**/.turbo",
+      "!**/coverage",
+      "!**/*.generated.*",
+      "!package-lock.json",
+      "!**/migrations",
+      "!**/meta",
+      "!.cache",
+      "!.claude",
+      "!.trigger",
+      "!.vercel",
+      "!bun.lock",
+      "!playwright-report",
+      "!test-results",
+      "!.content-collections",
+      "!.source"
+    ]
+  },
+  "linter": {
+    "rules": {
+      "a11y": {
+        "noSvgWithoutTitle": "off",
+        "useSemanticElements": "off",
+        "useFocusableInteractive": "off",
+        "useAriaPropsSupportedByRole": "off",
+        "useAriaPropsForRole": "off"
+      },
+      "complexity": {
+        "noExcessiveCognitiveComplexity": "off",
+        "noUselessFragments": "off"
+      },
+      "correctness": {
+        "useExhaustiveDependencies": "off",
+        "noConstantCondition": "off",
+        "noUnusedImports": "off"
+      },
+      "performance": {
+        "noNamespaceImport": "off",
+        "useTopLevelRegex": "off",
+        "noImgElement": "off"
+      },
+      "style": {
+        "noEnum": "off",
+        "noNestedTernary": "warn",
+        "useConsistentMemberAccessibility": "off",
+        "noProcessEnv": "off",
+        "useCollapsedIf": "off",
+        "noNonNullAssertion": "off",
+        "noIncrementDecrement": "off"
+      },
+      "suspicious": {
+        "noArrayIndexKey": "off",
+        "noExplicitAny": "off",
+        "noDocumentCookie": "off",
+        "noAssignInExpressions": "off",
+        "noShadow": "off"
+      },
+      "security": {
+        "noDangerouslySetInnerHtml": "off"
+      },
+      "nursery": {}
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/*.test.ts", "**/*.test.tsx", "**/tests/**/*"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "scripts/**/*.ts",
+        "tests/support/**/*.ts",
+        "vitest.config.mts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noProcessEnv": "off",
+            "useCollapsedIf": "off",
+            "useCollapsedElseIf": "off"
+          },
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    }
+  ]
+}
