@@ -1,0 +1,21 @@
+{$DOMAIN:localhost} {
+	encode gzip zstd
+
+	# Keep provider waitpoint callbacks unauthenticated (protected by per-waitpoint secret tokens).
+	handle /api/waitpoints/* {
+		reverse_proxy app:3000
+	}
+
+	# Optional HTTP Basic Auth for single-tenant UI/API access.
+	# Generate hash with: docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-strong-password'
+	# Then uncomment below and set BASIC_AUTH_USER + BASIC_AUTH_HASH in .env:
+	#
+	# handle {
+	# 	basic_auth {
+	# 		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	# 	}
+	# 	reverse_proxy app:3000
+	# }
+
+	reverse_proxy app:3000
+}

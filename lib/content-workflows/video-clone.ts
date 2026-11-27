@@ -5,7 +5,7 @@ export const SEEDANCE_MIN_SECONDS = 4;
 export const MAX_TAKE_SECONDS = 30;
 /** How long changes can grow a video: TikTok's 10-minute upload limit. */
 export const MAX_STORY_SECONDS = 600;
-// ponytail: guess at how many cuts Seedance can land in one take; tune once real drafts come back.
+// Note: guess at how many cuts Seedance can land in one take; tune once real drafts come back.
 export const MAX_CUTS_PER_SECOND = 1;
 
 export const VIDEO_CLONE_DIFFICULTIES = ["easy", "hard", "manual"] as const;
@@ -897,7 +897,7 @@ const MAX_CUT_DRIFT = 2;
  * Pairs the planned cuts with the detected ones in order, with the least total drift: a detected
  * cut paired with none is extra (Seedance cut inside a part); a planned cut with no detected one
  * within MAX_CUT_DRIFT keeps its planned time.
- * ponytail: absolute drift; Seedance stretching a long take by more than MAX_CUT_DRIFT unpairs its late cuts.
+ * Note: absolute drift; Seedance stretching a long take by more than MAX_CUT_DRIFT unpairs its late cuts.
  */
 function alignCuts(planned: number[], found: number[]) {
   // cost[i][j]: the best pairing of the first i planned cuts within the first j found.
@@ -1323,7 +1323,7 @@ const MAX_OVERLAY_CHARS = 90;
  * " / ", ";", line breaks) or more than fits one screen, each turn as long as its share of the
  * characters. Original footage already shows its text, so it gets none.
  */
-// ponytail: the analysis has no per-caption timing, so turns are spread evenly; time them if they drift from the lines.
+// Note: the analysis has no per-caption timing, so turns are spread evenly; time them if they drift from the lines.
 export function videoCloneTextOverlays(
   takes: { index: number; analysis: { onScreenText: string } }[],
   /** The edit's layout (layoutVideoCloneEdit). */
@@ -1367,7 +1367,7 @@ export function videoCloneTextOverlays(
 
 /**
  * Whole-video call from the share of manual seconds; hard takes are still rendered.
- * ponytail: fixed threshold; tune once real Seedance pass rates come back.
+ * Note: fixed threshold; tune once real Seedance pass rates come back.
  */
 export function videoCloneVerdict(
   takes: { seconds: number; analysis: { difficulty: VideoCloneDifficulty } }[],

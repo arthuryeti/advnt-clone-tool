@@ -208,7 +208,7 @@ describe("Postgres + SeaweedFS + Mock HTTP Server Crash Recovery & Fault Injecti
   };
 
   beforeAll(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), "advnt-int-"));
+    tempDir = await mkdtemp(join(tmpdir(), "video-clone-int-"));
     const samplePath = join(tempDir, "sample.mp4");
     execFileSync(
       "ffmpeg",

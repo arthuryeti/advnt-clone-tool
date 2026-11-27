@@ -19,7 +19,7 @@ export type PreviewClip = {
 };
 
 function Clips({ clips }: { clips: PreviewClip[] }) {
-  // ponytail: every clip stays mounted (one <video> each, hidden at its nearest edge frame), so a
+  // Note: every clip stays mounted (one <video> each, hidden at its nearest edge frame), so a
   // seek anywhere (hover, click, ↑/↓) lands on a loaded video instead of a black one. Mount only a
   // window around the playhead if edits grow to dozens of clips.
   const { durationInFrames } = useVideoConfig();
@@ -76,7 +76,7 @@ export function ClonePreview({
       download.waitUntilDone().then(settle, settle);
     }
   }, [filesKey]);
-  // ponytail: files stay in memory until the page closes, so a version picked back plays at once;
+  // Note: files stay in memory until the page closes, so a version picked back plays at once;
   // free the ones no clip plays if long sessions get heavy.
   React.useEffect(() => {
     const current = downloads.current;

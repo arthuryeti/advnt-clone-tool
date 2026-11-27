@@ -150,7 +150,7 @@ export async function stitchVideoCloneEdit(
       files[input] as string,
       "-filter_complex",
       [
-        // ponytail: CPU motion interpolation (~1.3x realtime here); a GPU RIFE pass if faces/hands warp.
+        // Note: CPU motion interpolation (~1.3x realtime here); swap in GPU RIFE if faces/hands warp.
         `[0:v]setpts=PTS-STARTPTS,scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,minterpolate=fps=${FPS}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,fps=${FPS},tpad=stop=-1:stop_mode=clone,trim=end_frame=${frames},format=yuv420p[v]`,
         probes[input]?.hasAudio
           ? `[0:a]asetpts=PTS-STARTPTS,${audioFormat},apad=whole_dur=${length},atrim=duration=${length}[a]`

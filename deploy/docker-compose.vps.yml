@@ -1,0 +1,80 @@
+# Production VPS stack (single instance + Postgres + Caddy auto-HTTPS reverse proxy).
+# Usage:
+#   cp .env.example .env  # set DOMAIN, SITE_URL=https://<DOMAIN>, external R2/S3 (or enable local s3 profile), and BYOK keys
+#   docker compose -f deploy/docker-compose.vps.yml up -d --build
+# To also run bundled SeaweedFS S3 on the VPS (ensure firewall + S3_PUBLIC_ENDPOINT), pass `--profile bundled-s3`.
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-clone}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clone}
+      POSTGRES_DB: ${POSTGRES_DB:-clone}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-clone} -d ${POSTGRES_DB:-clone}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  s3:
+    profiles: ["bundled-s3"]
+    image: chrislusf/seaweedfs
+    restart: unless-stopped
+    command: server -s3 -dir=/data
+    volumes:
+      - s3_data:/data
+
+  s3-bucket:
+    profiles: ["bundled-s3"]
+    image: amazon/aws-cli
+    depends_on: [s3]
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-clone}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-clone-secret}
+      AWS_DEFAULT_REGION: ${S3_REGION:-auto}
+    entrypoint: >
+      sh -c "until aws --endpoint-url http://s3:8333 s3api head-bucket --bucket ${S3_BUCKET:-clone-media} 2>/dev/null
+      || aws --endpoint-url http://s3:8333 s3 mb s3://${S3_BUCKET:-clone-media}; do sleep 2; done"
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: ../.env
+        required: true
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://clone:clone@postgres:5432/clone}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:-}
+      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  postgres_data:
+  s3_data:
+  caddy_data:
+  caddy_config:

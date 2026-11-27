@@ -1,6 +1,8 @@
 {
   "name": "video-clone",
   "version": "0.1.0",
+  "description": "Open-source AI video cloning studio: analyze short-form videos into shot-by-shot plans, swap faces/products/scripts, render with BYOK video providers, and stitch the final cut.",
+  "license": "MIT",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -13,8 +15,10 @@
     "test": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.mts",
     "preflight": "node --conditions=react-server --import ./scripts/register-paths.mjs scripts/preflight.ts",
+    "doctor": "npm run preflight",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "db:migrate:prod": "node scripts/migrate.mjs",
     "docker:up": "docker compose up -d"
   },
   "dependencies": {
