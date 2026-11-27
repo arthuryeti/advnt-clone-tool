@@ -1,11 +1,11 @@
 # Advnt Video Clone
 
-[![GitHub Repo](https://img.shields.io/badge/GitHub-arthuryeti%2Fadvnt--clone--tool-181717?style=flat-square&logo=github)](https://github.com/arthuryeti/advnt-clone-tool)
-[![Next.js 16](https://img.shields.io/badge/Next.js_16-Node_24%2B-000000?style=flat-square&logo=next.js)](https://nextjs.org/)
-[![Runtime: Postgres + S3](https://img.shields.io/badge/runtime-Postgres_%2B_S3_%2B_ffmpeg-336791?style=flat-square)](docker-compose.yml)
-[![BYOK: 9 Provider Adapters](https://img.shields.io/badge/BYOK-9_AI_Adapters-22d3ee?style=flat-square)](#bring-your-own-keys-byok)
-[![Verified: 87 Contract + 6 Crash](https://img.shields.io/badge/tests-87_contract_%2B_6_crash-22c55e?style=flat-square)](#architecture--verification)
-[![License: MIT](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
+[![GitHub Repo](https://img.shields.io/badge/GitHub-arthuryeti%2Fadvnt--clone--tool-18181B?style=flat-square&logo=github&logoColor=fafafa&labelColor=09090B)](https://github.com/arthuryeti/advnt-clone-tool)
+[![Next.js 16](https://img.shields.io/badge/Next.js_16-Node_24%2B-18181B?style=flat-square&logo=next.js&logoColor=fafafa&labelColor=09090B)](https://nextjs.org/)
+[![Runtime: Postgres + S3](https://img.shields.io/badge/runtime-Postgres_%2B_S3_%2B_ffmpeg-18181B?style=flat-square&labelColor=09090B)](docker-compose.yml)
+[![BYOK: 9 Provider Adapters](https://img.shields.io/badge/BYOK-9_AI_Adapters-18181B?style=flat-square&labelColor=09090B)](#bring-your-own-keys-byok)
+[![Verified: 87 Contract + 6 Crash](https://img.shields.io/badge/tests-87_contract_%2B_6_crash-18181B?style=flat-square&labelColor=09090B)](#architecture--verification)
+[![License: MIT](https://img.shields.io/badge/license-MIT-18181B?style=flat-square&labelColor=09090B)](LICENSE)
 
 **Self-hostable, BYOK AI video cloning studio in a single container.** Paste a TikTok or Instagram URL (or upload an MP4) to split a reference video into timed shots and takes, recast who plays who with your own faces and product photos, rewrite the script or visual look in plain English, render takes across pluggable AI video generators, and export a stitched vertical cut.
 
