@@ -1,6 +1,7 @@
 import "server-only";
 
 import { ProviderError } from "@/lib/ai/errors";
+import { falVideoProvider } from "@/lib/ai/providers/video/fal";
 import { kieVideoProvider } from "@/lib/ai/providers/video/kie";
 import { revanaVideoProvider } from "@/lib/ai/providers/video/revana";
 import { sumeVideoProvider } from "@/lib/ai/providers/video/sume";
@@ -17,6 +18,7 @@ const VIDEO_PROVIDERS: readonly VideoGenerationProvider[] = [
   kieVideoProvider,
   revanaVideoProvider,
   sumeVideoProvider,
+  falVideoProvider,
 ];
 
 const PROVIDER_MAP = new Map<string, VideoGenerationProvider>(
