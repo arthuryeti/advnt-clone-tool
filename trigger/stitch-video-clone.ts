@@ -13,11 +13,11 @@ import {
   videoCloneTextOverlays,
 } from "@/lib/content-workflows/video-clone";
 import {
-  addVideoCloneRenderCuts,
-  setVideoCloneEdit,
+  claimNextQueuedStitchJob,
+  commitVideoCloneEdit,
 } from "@/lib/content-workflows/video-clone-store";
 import { db } from "@/lib/db";
-import { contentTemplateTable } from "@/lib/db/schema";
+import { backgroundJobTable, contentTemplateTable } from "@/lib/db/schema";
 import { schemaTask } from "@/lib/jobs";
 import { renderTextLayersImage } from "@/lib/post/render-slide-text-overlay";
 import { createDefaultSlideTextLayer } from "@/lib/post/text-layers";
@@ -49,12 +49,7 @@ const ffprobeSchema = z.object({
 });
 
 /**
- * Cuts the plan's renders into one video in story order: every part from its own render when it
- * was redone alone, else from the take render picked for it or its take's render, following that
- * render's own cuts. Takes not rendered yet keep the source's footage; added ones are left out
- * until rendered. Returns the mp4's path inside `dir`, the same cut with the takes' on-screen text
- * burned in when they have any (`textFile`), where each part plays in it, and every render's cuts
- * and length by file.
+ * Cuts the plan's renders into one video in story order.
  */
 export async function stitchVideoCloneEdit(
   plan: VideoClone,
@@ -73,7 +68,6 @@ export async function stitchVideoCloneEdit(
     return file;
   };
   const files: string[] = [];
-  /** Render URL → its ffmpeg input number: a file several parts play downloads once. */
   const inputs = new Map<string, number>();
   const sources = videoCloneEditSources(plan);
   for (const url of new Set([
@@ -85,7 +79,6 @@ export async function stitchVideoCloneEdit(
     files.push(await download(url, `render-${files.length}.mp4`));
   }
   const sourceInput = files.length;
-  // Only takes of the original have footage to fall back on.
   if (
     plan.takes.some((take) => !sources.takes.has(take.index) && take.videoUrl)
   ) {
@@ -111,11 +104,9 @@ export async function stitchVideoCloneEdit(
       };
     }),
   );
-  // The first render sets the frame; source footage is scaled and padded into it.
   const width = probes[0]?.video?.width;
   const height = probes[0]?.video?.height;
   if (!width || !height) throw new Error("A render has no video stream.");
-  // Each take render's cuts are found once and kept (renderCuts); a part's own render plays whole.
   const cutting = new Set([
     ...sources.takes.values(),
     ...sources.picked.values(),
@@ -137,16 +128,12 @@ export async function stitchVideoCloneEdit(
     (url, planned) => renderCuts[url] ?? planned,
   );
 
-  // Each part is cut to its own file, one ffmpeg at a time: one graph holding every part's
-  // minterpolate (~290 bytes a pixel each) plus the frames queued for concat ran out of memory
-  // (14 parts of a 480p take: 2.2 GB, past medium-1x).
   const audioFormat =
     "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo";
   const list: string[] = [];
   for (const [i, { src, start, end }] of segments.entries()) {
     const input =
       (src === undefined ? undefined : inputs.get(src)) ?? sourceInput;
-    // A whole number of frames with its sound just as long, so the joined parts stay in sync.
     const frames = Math.max(1, Math.round((end - start) * FPS));
     const length = frames / FPS;
     const part = `part-${i}.mkv`;
@@ -163,11 +150,8 @@ export async function stitchVideoCloneEdit(
       files[input] as string,
       "-filter_complex",
       [
-        // Seedance renders 24fps; fps=30 alone repeats every 4th frame (judder), so minterpolate makes the missing ones.
-        // minterpolate drops its last 1-2 frames: fps fills them and tpad/trim pin the part's frame count.
         // ponytail: CPU motion interpolation (~1.3x realtime here); a GPU RIFE pass if faces/hands warp.
         `[0:v]setpts=PTS-STARTPTS,scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,minterpolate=fps=${FPS}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,fps=${FPS},tpad=stop=-1:stop_mode=clone,trim=end_frame=${frames},format=yuv420p[v]`,
-        // Silent clips (takes without lines) still need audio so the joined sound stays in sync.
         probes[input]?.hasAudio
           ? `[0:a]asetpts=PTS-STARTPTS,${audioFormat},apad=whole_dur=${length},atrim=duration=${length}[a]`
           : `anullsrc=r=44100:cl=stereo,atrim=duration=${length},${audioFormat}[a]`,
@@ -176,7 +160,6 @@ export async function stitchVideoCloneEdit(
       "[v]",
       "-map",
       "[a]",
-      // Near-lossless: the edit is encoded from these once more below.
       "-c:v",
       "libx264",
       "-preset",
@@ -191,7 +174,6 @@ export async function stitchVideoCloneEdit(
   }
   const parts = join(dir, "parts.txt");
   await writeFile(parts, list.join("\n"));
-  // The text plays over a copy of the cut: frames for picking stills stay clean.
   const overlays = videoCloneTextOverlays(plan.takes, segments);
   const images = await Promise.all(
     overlays.map(async ({ text }, i) => {
@@ -266,7 +248,95 @@ export async function stitchVideoCloneEdit(
   };
 }
 
-/** Stitches the plan's current renders into `structure.video.edit`; the render task starts it after each run. */
+async function runOneStitchPass(payload: {
+  organizationId: string;
+  templateId: string;
+}): Promise<{ stitched: boolean }> {
+  const template = await db.query.contentTemplateTable.findFirst({
+    where: and(
+      eq(contentTemplateTable.id, payload.templateId),
+      eq(contentTemplateTable.organizationId, payload.organizationId),
+    ),
+    columns: { id: true, structure: true },
+  });
+  const plan = template?.structure.video;
+  if (!template || !plan) throw new Error("Clone plan not found.");
+  const targetRevision = plan.edit?.revision ?? 0;
+
+  const rendered = plan.takes
+    .filter(
+      (take) =>
+        !keepsOriginal(take) &&
+        take.generation?.status === "done" &&
+        take.generation.videoUrl,
+    )
+    .map((take) => take.index);
+
+  const previous = {
+    videoUrl: plan.edit?.videoUrl,
+    textVideoUrl: plan.edit?.textVideoUrl,
+    rendered: plan.edit?.rendered ?? [],
+    parts: plan.edit?.parts,
+  };
+  const startedAt = new Date().toISOString();
+
+  if (rendered.length === 0) {
+    await commitVideoCloneEdit(template.id, targetRevision, {
+      status: "done",
+      rendered: [],
+      startedAt,
+    });
+    return { stitched: false };
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "video-clone-edit-"));
+  try {
+    const { file, textFile, parts, renderCuts } = await stitchVideoCloneEdit(
+      plan,
+      dir,
+    );
+    const bucket = storageConfig.bucketNames.images;
+    const store = async (mp4: string, name: string) => {
+      const path = `video-clones/${payload.organizationId}/generations/${template.id}/${name}-${crypto.randomUUID()}.mp4`;
+      await putObject(path, bucket, await readFile(mp4), "video/mp4");
+      return `/storage/${bucket}/${path}`;
+    };
+    const videoUrl = await store(file, "edit");
+    const textVideoUrl = textFile
+      ? await store(textFile, "edit-text")
+      : undefined;
+
+    await commitVideoCloneEdit(
+      template.id,
+      targetRevision,
+      {
+        status: "done",
+        videoUrl,
+        textVideoUrl,
+        rendered,
+        parts,
+        startedAt,
+      },
+      renderCuts,
+    );
+    return { stitched: true };
+  } catch (error) {
+    await commitVideoCloneEdit(template.id, targetRevision, {
+      ...previous,
+      status: "failed",
+      error: getErrorMessage(error) || "Couldn't stitch the takes.",
+      startedAt,
+    });
+    throw error;
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Stitches the plan's current renders into `structure.video.edit` using monotonic revision checks,
+ * draining any queued follow-up stitch serialized behind it.
+ */
 export const stitchVideoCloneTask = schemaTask({
   id: triggerTaskIds.stitchVideoClone,
   schema: z.object({
@@ -274,74 +344,40 @@ export const stitchVideoCloneTask = schemaTask({
     templateId: z.string().uuid(),
   }),
   run: async (payload) => {
-    const template = await db.query.contentTemplateTable.findFirst({
-      where: and(
-        eq(contentTemplateTable.id, payload.templateId),
-        eq(contentTemplateTable.organizationId, payload.organizationId),
-      ),
-      columns: { id: true, structure: true },
-    });
-    const plan = template?.structure.video;
-    if (!template || !plan) throw new Error("Clone plan not found.");
-    const rendered = plan.takes
-      .filter(
-        (take) =>
-          !keepsOriginal(take) &&
-          take.generation?.status === "done" &&
-          take.generation.videoUrl,
-      )
-      .map((take) => take.index);
-    // Keep the last edit watchable if this one fails.
-    const previous = {
-      videoUrl: plan.edit?.videoUrl,
-      textVideoUrl: plan.edit?.textVideoUrl,
-      rendered: plan.edit?.rendered ?? [],
-      parts: plan.edit?.parts,
-    };
-    const startedAt = new Date().toISOString();
-    if (rendered.length === 0) {
-      // Every take is the original again: no edit to watch.
-      await setVideoCloneEdit(template.id, {
-        status: "done",
-        rendered: [],
-        startedAt,
-      });
-      return { stitched: false };
+    const firstResult = await runOneStitchPass(payload);
+
+    // Drain any coalesced queued stitch requested while this pass ran.
+    for (;;) {
+      const nextJob = await claimNextQueuedStitchJob(payload.templateId);
+      if (!nextJob) break;
+      try {
+        const nextPayload = nextJob.payload as {
+          organizationId: string;
+          templateId: string;
+        };
+        const out = await runOneStitchPass(nextPayload);
+        await db
+          .update(backgroundJobTable)
+          .set({
+            status: "done",
+            output: out,
+            finishedAt: new Date(),
+            heartbeatAt: new Date(),
+          })
+          .where(eq(backgroundJobTable.id, nextJob.id));
+      } catch (error) {
+        await db
+          .update(backgroundJobTable)
+          .set({
+            status: "failed",
+            error: getErrorMessage(error),
+            finishedAt: new Date(),
+            heartbeatAt: new Date(),
+          })
+          .where(eq(backgroundJobTable.id, nextJob.id));
+      }
     }
-    // ponytail: two runs finishing together each stitch what they saw; the last write wins.
-    const dir = await mkdtemp(join(tmpdir(), "video-clone-edit-"));
-    try {
-      const { file, textFile, parts, renderCuts } = await stitchVideoCloneEdit(
-        plan,
-        dir,
-      );
-      // The page previews with these from now on: the same cuts as this edit.
-      await addVideoCloneRenderCuts(template.id, renderCuts);
-      const bucket = storageConfig.bucketNames.images;
-      const store = async (mp4: string, name: string) => {
-        const path = `video-clones/${payload.organizationId}/generations/${template.id}/${name}-${crypto.randomUUID()}.mp4`;
-        await putObject(path, bucket, await readFile(mp4), "video/mp4");
-        return `/storage/${bucket}/${path}`;
-      };
-      await setVideoCloneEdit(template.id, {
-        status: "done",
-        videoUrl: await store(file, "edit"),
-        textVideoUrl: textFile && (await store(textFile, "edit-text")),
-        rendered,
-        parts,
-        startedAt,
-      });
-      return { stitched: true };
-    } catch (error) {
-      await setVideoCloneEdit(template.id, {
-        ...previous,
-        status: "failed",
-        error: getErrorMessage(error) || "Couldn't stitch the takes.",
-        startedAt,
-      });
-      throw error;
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
+
+    return firstResult;
   },
 });

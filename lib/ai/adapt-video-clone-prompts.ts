@@ -1,12 +1,8 @@
 import "server-only";
 
-import { generateObject } from "ai";
 import { z } from "zod/v4";
-import {
-  getReasoningOptions,
-  TEXT_MODEL,
-  unwrapNamedObject,
-} from "@/lib/ai/model-policy";
+import { generateStructuredObject } from "@/lib/ai/providers/text/registry";
+import type { TextMessagePart } from "@/lib/ai/providers/text/types";
 import {
   addVideoCloneTakes,
   keepsOriginal,
@@ -18,23 +14,71 @@ import {
   videoCloneStory,
   videoCloneTakeAnalysisSchema,
 } from "@/lib/content-workflows/video-clone";
+import { getS3Config } from "@/lib/env";
+import { getObject, parseStorageObjectFromUrl } from "@/lib/storage";
+import { downloadRemoteBytes } from "@/lib/storage/download-video";
 
-/** Images for Opus, each after its label, downloaded from signed URLs. */
+const MAX_ATTACHMENT_IMAGE_BYTES = 20 * 1024 * 1024;
+
+function isOwnS3SignedUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    const s3 = getS3Config();
+    const internalOrigin = new URL(s3.endpoint).origin;
+    const publicOrigin = new URL(s3.publicEndpoint).origin;
+    return parsed.origin === internalOrigin || parsed.origin === publicOrigin;
+  } catch {
+    return false;
+  }
+}
+
+function extractOwnS3Object(
+  rawUrl: string,
+): { bucket: string; path: string } | null {
+  const stored = parseStorageObjectFromUrl(rawUrl);
+  if (stored) return stored;
+  if (!isOwnS3SignedUrl(rawUrl)) return null;
+  try {
+    const parsed = new URL(rawUrl);
+    const bucket = getS3Config().bucket;
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parts[0] === bucket && parts.length > 1) {
+      return { bucket, path: parts.slice(1).join("/") };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/** Images for the text/vision model, each after its label, loaded via S3 or SSRF-safe download. */
 async function labeledImages(
   attachments: { label: string; what: string; url: string }[],
-) {
+): Promise<TextMessagePart[]> {
   const parts = await Promise.all(
     attachments.map(async ({ label, what, url }) => {
-      const response = await globalThis.fetch(url);
-      if (!response.ok) {
-        throw new Error(`Couldn't download ${what} (${response.status}).`);
+      const ownObject = extractOwnS3Object(url);
+      let data: Uint8Array;
+      let mediaType = "image/jpeg";
+      if (ownObject) {
+        data = await getObject(ownObject.path, ownObject.bucket);
+        if (url.toLowerCase().endsWith(".png")) mediaType = "image/png";
+        else if (url.toLowerCase().endsWith(".webp")) mediaType = "image/webp";
+      } else {
+        const downloaded = await downloadRemoteBytes(url, {
+          label: what,
+          maxBytes: MAX_ATTACHMENT_IMAGE_BYTES,
+          timeoutMs: 30_000,
+        });
+        data = downloaded.bytes;
+        mediaType = downloaded.contentType || "image/jpeg";
       }
       return [
         { type: "text" as const, text: label },
         {
-          type: "file" as const,
-          data: new Uint8Array(await response.arrayBuffer()),
-          mediaType: response.headers.get("content-type") || "image/jpeg",
+          type: "image" as const,
+          data,
+          mediaType,
         },
       ];
     }),
@@ -44,17 +88,17 @@ async function labeledImages(
 
 /**
  * Applies the user's requested changes, the recast characters, and our products to the selected
- * takes' Seedance prompts. All takes go in as context so the rewritten script stays coherent.
+ * takes' prompts. All takes go in as context so the rewritten script stays coherent.
  */
 export async function adaptVideoClonePrompts(input: {
   plan: VideoClone;
   takeIndexes: number[];
   changes: string;
-  /** Character id → signed URL of the avatar that plays them. */
+  /** Character id -> signed URL of the avatar that plays them. */
   cast: Map<string, string>;
   /** Signed image URLs; product N is `{{productN}}`. */
   products: { name: string; url: string }[];
-  /** Take index → the product numbers the user pinned on it. */
+  /** Take index -> the product numbers the user pinned on it. */
   pinned: Map<number, number[]>;
 }): Promise<Map<number, string>> {
   const creatorId = input.plan.vibe.characters.find(
@@ -62,8 +106,6 @@ export async function adaptVideoClonePrompts(input: {
   )?.id;
   const castToken = (id: string) =>
     id === creatorId ? "{{creator}}" : `{{cast:${id}}}`;
-  // Opus sees the new faces (pronouns, a man playing a woman's part) and matches our products
-  // to the original's by looking at them; file names are often junk.
   const attachments = [
     ...[...input.cast].map(([id, url]) => ({
       label: `CAST IMAGE ${castToken(id)} plays ${id}:`,
@@ -79,10 +121,9 @@ export async function adaptVideoClonePrompts(input: {
   const images = await labeledImages(attachments);
   const productCount = input.products.length;
 
-  const result = await generateObject({
-    model: TEXT_MODEL,
-    instructions: [
-      "You adapt Seedance 2.5 video prompts from a shot-by-shot clone plan of a short-form video.",
+  const output = await generateStructuredObject({
+    system: [
+      "You adapt video prompts from a shot-by-shot clone plan of a short-form video.",
       "Rewrite only the takes listed under TAKES TO REWRITE. The requested changes win over the original: they may change the story, the dialogue, the setting, or the cast. Keep what they don't touch: framing, camera, the 'Part N (a-bs)' labels, hard cuts, and timing (every line must still fit its part's seconds).",
       "Dialogue: keep every original line exactly as spoken, word for word, unless the requested changes ask for different lines.",
       "A rewritten line keeps its speaker and roughly its length; read ALL TAKES so the script still flows as one story.",
@@ -97,51 +138,45 @@ export async function adaptVideoClonePrompts(input: {
         : "There is no product image: describe our product in words, never write {{product}}.",
       "No on-screen text, captions, logos, or UI in the video. English prompt.",
     ].join("\n"),
-    messages: [
+    parts: [
       {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: [
-              `VIDEO: ${input.plan.vibe.format}. ${input.plan.vibe.summary}`,
-              `PRODUCT: ${productCount > 0 ? "see OUR PRODUCTS" : "none given; keep the product generic"}`,
-              `CAST: ${JSON.stringify(input.plan.vibe.characters)}`,
-              `REQUESTED CHANGES: ${input.changes || "none"}`,
-              `ALL TAKES (context):\n${input.plan.takes.map((take) => `Take ${take.index} (${take.seconds}s): ${take.analysis.prompt}`).join("\n\n")}`,
-              `TAKES TO REWRITE: ${input.takeIndexes.join(", ")}`,
-              ...(input.pinned.size > 0
-                ? [
-                    `PRODUCTS PER TAKE: ${[...input.pinned]
-                      .map(
-                        ([index, numbers]) =>
-                          `Take ${index}: ${numbers.map((n) => `{{product${n}}}`).join(", ")}`,
-                      )
-                      .join("; ")}`,
-                  ]
-                : []),
-            ].join("\n\n"),
-          },
-          ...images,
-        ],
+        type: "text",
+        text: [
+          `VIDEO: ${input.plan.vibe.format}. ${input.plan.vibe.summary}`,
+          `PRODUCT: ${productCount > 0 ? "see OUR PRODUCTS" : "none given; keep the product generic"}`,
+          `CAST: ${JSON.stringify(input.plan.vibe.characters)}`,
+          `REQUESTED CHANGES: ${input.changes || "none"}`,
+          `ALL TAKES (context):\n${input.plan.takes.map((take) => `Take ${take.index} (${take.seconds}s): ${take.analysis.prompt}`).join("\n\n")}`,
+          `TAKES TO REWRITE: ${input.takeIndexes.join(", ")}`,
+          ...(input.pinned.size > 0
+            ? [
+                `PRODUCTS PER TAKE: ${[...input.pinned]
+                  .map(
+                    ([index, numbers]) =>
+                      `Take ${index}: ${numbers.map((n) => `{{product${n}}}`).join(", ")}`,
+                  )
+                  .join("; ")}`,
+              ]
+            : []),
+        ].join("\n\n"),
       },
+      ...images,
     ],
     schema: z.object({
       takes: z.array(z.object({ index: z.number().int(), prompt: z.string() })),
     }),
     schemaName: "videoClonePrompts",
-    providerOptions: getReasoningOptions("low"),
-    telemetry: { isEnabled: true, functionId: "adapt-video-clone-prompts" },
+    reasoningEffort: "low",
   });
   return new Map(
-    result.object.takes
+    output.takes
       .filter((take) => input.takeIndexes.includes(take.index))
       .map((take) => [take.index, take.prompt]),
   );
 }
 
 /**
- * Rewrites one take's Seedance prompt to speak the user's own script lines, so they can
+ * Rewrites one take's prompt to speak the user's own script lines, so they can
  * tweak a take before paying for its render. Everything else changes from the render's Changes.
  */
 export async function reviseVideoCloneTakePrompt(input: {
@@ -152,31 +187,33 @@ export async function reviseVideoCloneTakePrompt(input: {
 }) {
   const take = input.plan.takes.find((item) => item.index === input.takeIndex);
   if (!take) throw new Error("Unknown take.");
-  const result = await generateObject({
-    model: TEXT_MODEL,
-    instructions: [
-      "You edit one take's Seedance 2.5 prompt in a shot-by-shot clone plan of a short-form video.",
+  return generateStructuredObject({
+    system: [
+      "You edit one take's prompt in a shot-by-shot clone plan of a short-form video.",
       "Make the prompt speak the NEW LINES: they are the user's own words, so keep them word for word. Change only what they need; keep everything else as written: framing, camera, the 'Part N (a-bs)' labels, hard cuts, {{creator}}, {{cast:...}}, and {{product}} tokens, and character descriptions.",
       "Every spoken line goes in the prompt in quotes with who says it, in the part where it fits; a part's lines must fit its seconds (about 2.5 words per second). Read ALL TAKES so the script still flows as one story.",
       "Return the full new prompt and the take's dialogue: every line spoken, in order, with its speaker id from CAST. No on-screen text, captions, logos, or UI in the video.",
     ].join("\n"),
-    prompt: [
-      `VIDEO: ${input.plan.vibe.format}. ${input.plan.vibe.summary}`,
-      `CAST: ${JSON.stringify(input.plan.vibe.characters)}`,
-      `ALL TAKES (context):\n${input.plan.takes.map((item) => `Take ${item.index} (${item.seconds}s): ${item.analysis.prompt}`).join("\n\n")}`,
-      `TAKE ${take.index} (${take.seconds}s) PROMPT:\n${take.analysis.prompt}`,
-      `TAKE ${take.index} DIALOGUE: ${JSON.stringify(take.analysis.dialogue)}`,
-      `NEW LINES: ${JSON.stringify(input.dialogue)}`,
-    ].join("\n\n"),
+    parts: [
+      {
+        type: "text",
+        text: [
+          `VIDEO: ${input.plan.vibe.format}. ${input.plan.vibe.summary}`,
+          `CAST: ${JSON.stringify(input.plan.vibe.characters)}`,
+          `ALL TAKES (context):\n${input.plan.takes.map((item) => `Take ${item.index} (${item.seconds}s): ${item.analysis.prompt}`).join("\n\n")}`,
+          `TAKE ${take.index} (${take.seconds}s) PROMPT:\n${take.analysis.prompt}`,
+          `TAKE ${take.index} DIALOGUE: ${JSON.stringify(take.analysis.dialogue)}`,
+          `NEW LINES: ${JSON.stringify(input.dialogue)}`,
+        ].join("\n\n"),
+      },
+    ],
     schema: z.object({
       prompt: z.string(),
       dialogue: videoCloneTakeAnalysisSchema.shape.dialogue,
     }),
     schemaName: "videoCloneTakeRevision",
-    providerOptions: getReasoningOptions("low"),
-    telemetry: { isEnabled: true, functionId: "revise-video-clone-take" },
+    reasoningEffort: "low",
   });
-  return result.object;
 }
 
 /** Our product as a rewrite sees it: the product folder's photos (signed URLs). */
@@ -187,14 +224,7 @@ export type VideoCloneProductContext = {
 const round = (value: number) => Math.round(value * 100) / 100;
 
 /**
- * Applies the user's changes before any render. The look (style, era, camera, lighting, setting,
- * wardrobe) goes into the prompts; the lines change only when the request is about the words;
- * timing stretches or trims parts; a bigger script (new beats, a product plug, minutes more)
- * adds takes in the original's world; a reworked story rewrites any take and writes added takes
- * again in their new place, packed into ~30s takes (`replaces`). Two passes: Opus writes the
- * script (what changes, what's added where, every new line), then each added take's prompt, in
- * parallel. Returns the changed takes (dialogue/parts null when they stay), the addition
- * (addVideoCloneTakes), and a summary.
+ * Applies the user's changes before any render.
  */
 export async function applyVideoCloneChanges(input: {
   plan: VideoClone;
@@ -216,9 +246,8 @@ export async function applyVideoCloneChanges(input: {
       url: image.url,
     })),
   );
-  const result = await generateObject({
-    model: TEXT_MODEL,
-    instructions: [
+  const output = await generateStructuredObject({
+    system: [
       "You rewrite a shot-by-shot clone plan of a short-form video: per take (one AI video generation, Seedance or Wan, up to 30s), its prompt and the lines spoken in it. STORY lists every shot in the order the video plays them.",
       "Apply the CHANGES. A change to the look (aesthetic, era, film or camera format, color, lighting, camera work, setting, wardrobe, props, mood) goes into the prompts only: rewrite each affected prompt's visual description so the generation looks that way, e.g. 'VHS 80s sitcom' means 4:3-feeling soft analog video, tracking noise, warm flat multi-cam studio lighting, a sitcom set. Keep the lines word for word for those.",
       "Takes are rendered separately, so a person's look or a place must read the same everywhere it appears: a change to one applies, in the same words, to every take showing it.",
@@ -232,29 +261,24 @@ export async function applyVideoCloneChanges(input: {
       "Takes marked KEEP ORIGINAL use the original footage and sound: never change them, and keep the rest consistent with them.",
       "Return only the existing takes you change, each with its full new prompt, its dialogue only if its lines changed (every line, in order, with its speaker id from CAST; otherwise null), and its partSeconds only if its timing changed (otherwise null); the added takes; and a one-sentence summary of what you changed, for the user, in plain words (no {{tokens}}).",
     ].join("\n"),
-    messages: [
+    parts: [
       {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: [
-              ...context,
-              `SCENES: ${JSON.stringify(plan.scenes)}`,
-              `CONTINUITY: ${JSON.stringify((plan.continuity ?? []).map(({ label }) => label))}`,
-              `STORY:\n${story.map((slot) => `shot ${slot.shot}: take ${slot.take} part ${(plan.takes.find((take) => take.index === slot.take)?.parts.findIndex((part) => part.shot === slot.shot) ?? 0) + 1}, ${round(slot.end - slot.start)}s, scene ${slot.sceneId ?? "?"}`).join("\n")}`,
-              `TAKES:\n${plan.takes
-                .map(
-                  (take) =>
-                    `Take ${take.index} (${take.seconds}s)${keepsOriginal(take) ? " KEEP ORIGINAL" : ""}${take.videoUrl ? "" : " ADDED"}\nPART SECONDS: ${JSON.stringify(take.parts.map((part) => round(part.takeEnd - part.takeStart)))}\nPROMPT: ${take.analysis.prompt}\nDIALOGUE: ${JSON.stringify(take.analysis.dialogue)}`,
-                )
-                .join("\n\n")}`,
-              `CHANGES: ${input.changes}`,
-            ].join("\n\n"),
-          },
-          ...productImages,
-        ],
+        type: "text",
+        text: [
+          ...context,
+          `SCENES: ${JSON.stringify(plan.scenes)}`,
+          `CONTINUITY: ${JSON.stringify((plan.continuity ?? []).map(({ label }) => label))}`,
+          `STORY:\n${story.map((slot) => `shot ${slot.shot}: take ${slot.take} part ${(plan.takes.find((take) => take.index === slot.take)?.parts.findIndex((part) => part.shot === slot.shot) ?? 0) + 1}, ${round(slot.end - slot.start)}s, scene ${slot.sceneId ?? "?"}`).join("\n")}`,
+          `TAKES:\n${plan.takes
+            .map(
+              (take) =>
+                `Take ${take.index} (${take.seconds}s)${keepsOriginal(take) ? " KEEP ORIGINAL" : ""}${take.videoUrl ? "" : " ADDED"}\nPART SECONDS: ${JSON.stringify(take.parts.map((part) => round(part.takeEnd - part.takeStart)))}\nPROMPT: ${take.analysis.prompt}\nDIALOGUE: ${JSON.stringify(take.analysis.dialogue)}`,
+            )
+            .join("\n\n")}`,
+          `CHANGES: ${input.changes}`,
+        ].join("\n\n"),
       },
+      ...productImages,
     ],
     schema: z.object({
       summary: z.string(),
@@ -290,15 +314,11 @@ export async function applyVideoCloneChanges(input: {
       ),
     }),
     schemaName: "videoCloneChanges",
-    experimental_repairText: unwrapNamedObject,
-    providerOptions: getReasoningOptions("low"),
-    telemetry: { isEnabled: true, functionId: "apply-video-clone-changes" },
+    reasoningEffort: "low",
   });
-  // Edits Opus may still echo for a kept or unknown take, or one written again below, are dropped.
-  const replaced = new Set(
-    result.object.added.flatMap((take) => take.replaces),
-  );
-  const takes = result.object.takes.flatMap((revised) => {
+  // Edits the model may still echo for a kept or unknown take, or one written again below, are dropped.
+  const replaced = new Set(output.added.flatMap((take) => take.replaces));
+  const takes = output.takes.flatMap((revised) => {
     const take = plan.takes.find(
       (item) =>
         item.index === revised.index &&
@@ -315,7 +335,7 @@ export async function applyVideoCloneChanges(input: {
           MAX_TAKE_SECONDS)
     ) {
       throw new Error(
-        `Opus retimed take ${take.index} to something it can't render (other parts, or past ${MAX_TAKE_SECONDS}s). Try again, or ask for less time.`,
+        `Model retimed take ${take.index} to something it can't render (other parts, or past ${MAX_TAKE_SECONDS}s). Try again, or ask for less time.`,
       );
     }
     return [
@@ -327,8 +347,8 @@ export async function applyVideoCloneChanges(input: {
       },
     ];
   });
-  if (result.object.added.length === 0) {
-    return { summary: result.object.summary, takes, addition: null };
+  if (output.added.length === 0) {
+    return { summary: output.summary, takes, addition: null };
   }
 
   const retimed = {
@@ -341,14 +361,14 @@ export async function applyVideoCloneChanges(input: {
   // Placement and length are checked before paying for the prompts.
   addVideoCloneTakes(
     retimed,
-    result.object.added.map((take) => ({
+    output.added.map((take) => ({
       ...take,
       partSeconds: take.parts.map((part) => part.seconds),
       analysis: null,
     })),
   );
   const added = await Promise.all(
-    result.object.added.map(async (take) => {
+    output.added.map(async (take) => {
       const prompt = await writeAddedTakePrompt({
         plan,
         context,
@@ -380,13 +400,13 @@ export async function applyVideoCloneChanges(input: {
     }),
   );
   return {
-    summary: result.object.summary,
+    summary: output.summary,
     takes,
     addition: addVideoCloneTakes(retimed, added),
   };
 }
 
-/** The Seedance prompt of one added take, in the look, places, and people of the rest. */
+/** The prompt of one added take, in the look, places, and people of the rest. */
 async function writeAddedTakePrompt(input: {
   plan: VideoClone;
   /** VIDEO, CURRENT LOOK, CAST, and PRODUCT lines. */
@@ -400,7 +420,6 @@ async function writeAddedTakePrompt(input: {
 }) {
   const { plan, take } = input;
   const scene = plan.scenes.find((item) => item.id === take.sceneId);
-  // The original's own prompts for that place carry its set, light, and wardrobe wording.
   const references = plan.takes
     .filter(
       (item) =>
@@ -413,39 +432,41 @@ async function writeAddedTakePrompt(input: {
     const label = `Part ${k + 1} (${round(at)}-${round((at += part.seconds))}s)`;
     return `${label}: ${part.beat}`;
   });
-  // The person with a reference image (the creator's face) is written as its token.
   const tokens = plan.vibe.characters.flatMap((character) =>
     character.reference === "creator"
       ? [`{{creator}} is ${character.id} (${character.role})`]
       : [],
   );
-  const result = await generateObject({
-    model: TEXT_MODEL,
-    instructions: [
-      "You write the Seedance 2.5 prompt for one take added to a shot-by-shot clone plan of a short-form video. It must look like the rest of the video: the same style, places, people, and outfits.",
+  const output = await generateStructuredObject({
+    system: [
+      "You write the prompt for one take added to a shot-by-shot clone plan of a short-form video. It must look like the rest of the video: the same style, places, people, and outfits.",
       "Vertical 9:16, realistic footage in the CURRENT LOOK. Write each part under its label exactly as given ('Part N (a-bs): ...') and end every part but the last with 'Hard cut.'; each part is one shot: framing, camera, setting, lighting, and the action beat by beat.",
       `${tokens.length > 0 ? "Each person under PEOPLE WITH AN IMAGE is written as their token every time they appear or speak (e.g. '{{cast:partner}}: \"line\"'), never by name: never describe their face, hair, or build, but always their outfit and accessories, in the same words as CAST. Everyone else gets" : "Everyone gets"} their full CAST description each time. Our product is {{product}}, followed the first time by a few words of what it looks like.`,
       "Every line goes in quotes with who says it, in the part where it's said, and fits that part's seconds. End with one line on delivery: the dialogue is natural and conversational, real people talking, each line answering the last, never clipped or robotic; listeners keep their mouths closed; natural micro-movements (blinks, small head tilts, breaths between phrases). No on-screen text, captions, subtitles, logos, or UI.",
     ].join("\n"),
-    prompt: [
-      ...input.context,
-      `PLACE: ${scene ? `${scene.location} (cast: ${scene.cast})` : "a new place the CHANGES ask for"}`,
-      ...(references.length > 0
-        ? [
-            `HOW THIS PLACE IS WRITTEN ELSEWHERE:\n${references.map((item) => item.analysis.prompt).join("\n\n")}`,
-          ]
-        : []),
-      `CHANGES BEHIND THIS TAKE: ${input.changes}`,
-      ...(tokens.length > 0
-        ? [`PEOPLE WITH AN IMAGE:\n${tokens.join("\n")}`]
-        : []),
-      `PARTS:\n${parts.join("\n")}`,
-      `LINES: ${JSON.stringify(take.dialogue)}`,
-    ].join("\n\n"),
+    parts: [
+      {
+        type: "text",
+        text: [
+          ...input.context,
+          `PLACE: ${scene ? `${scene.location} (cast: ${scene.cast})` : "a new place the CHANGES ask for"}`,
+          ...(references.length > 0
+            ? [
+                `HOW THIS PLACE IS WRITTEN ELSEWHERE:\n${references.map((item) => item.analysis.prompt).join("\n\n")}`,
+              ]
+            : []),
+          `CHANGES BEHIND THIS TAKE: ${input.changes}`,
+          ...(tokens.length > 0
+            ? [`PEOPLE WITH AN IMAGE:\n${tokens.join("\n")}`]
+            : []),
+          `PARTS:\n${parts.join("\n")}`,
+          `LINES: ${JSON.stringify(take.dialogue)}`,
+        ].join("\n\n"),
+      },
+    ],
     schema: z.object({ prompt: z.string() }),
     schemaName: "videoCloneAddedTake",
-    providerOptions: getReasoningOptions("low"),
-    telemetry: { isEnabled: true, functionId: "write-added-video-clone-take" },
+    reasoningEffort: "low",
   });
-  return result.object.prompt;
+  return output.prompt;
 }

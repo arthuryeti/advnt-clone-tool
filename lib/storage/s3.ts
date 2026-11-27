@@ -1,11 +1,12 @@
 import {
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadBucketCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl as getS3SignedUrl } from "@aws-sdk/s3-request-presigner";
-import { env } from "@/lib/env";
+import { getS3Config } from "@/lib/env";
 
 /**
  * Validates and sanitizes a storage path to prevent path traversal attacks.
@@ -47,33 +48,62 @@ function validatePath(path: string): string {
   return normalizedPath;
 }
 
-let s3Client: S3Client | null = null;
+let cachedClients: {
+  fingerprint: string;
+  internal: S3Client;
+  public: S3Client;
+} | null = null;
 
-function getS3Client(): S3Client {
-  if (!s3Client) {
-    const endpoint = env.S3_ENDPOINT;
-    const region = env.S3_REGION || "auto";
-    const accessKeyId = env.S3_ACCESS_KEY_ID;
-    const secretAccessKey = env.S3_SECRET_ACCESS_KEY;
+function buildClient(
+  endpoint: string,
+  region: string,
+  accessKeyId: string,
+  secretAccessKey: string,
+): S3Client {
+  return new S3Client({
+    region,
+    endpoint,
+    forcePathStyle: true,
+    // Presigned browser PUTs can't carry the SDK's default body checksum (it's signed as empty).
+    requestChecksumCalculation: "WHEN_REQUIRED",
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+    },
+  });
+}
 
-    if (!(endpoint && accessKeyId && secretAccessKey)) {
-      throw new Error("Missing one or more required S3 environment variables");
-    }
-
-    s3Client = new S3Client({
-      region,
-      endpoint,
-      forcePathStyle: true,
-      // Presigned browser PUTs can't carry the SDK's default body checksum (it's signed as empty).
-      requestChecksumCalculation: "WHEN_REQUIRED",
-      credentials: {
-        accessKeyId,
-        secretAccessKey,
-      },
-    });
+function getS3Clients() {
+  const cfg = getS3Config();
+  const fingerprint = `${cfg.endpoint}|${cfg.publicEndpoint}|${cfg.region}|${cfg.accessKeyId}|${cfg.secretAccessKey}`;
+  if (!cachedClients || cachedClients.fingerprint !== fingerprint) {
+    const internal = buildClient(
+      cfg.endpoint,
+      cfg.region,
+      cfg.accessKeyId,
+      cfg.secretAccessKey,
+    );
+    const pub =
+      cfg.publicEndpoint === cfg.endpoint
+        ? internal
+        : buildClient(
+            cfg.publicEndpoint,
+            cfg.region,
+            cfg.accessKeyId,
+            cfg.secretAccessKey,
+          );
+    cachedClients = { fingerprint, internal, public: pub };
   }
+  return cachedClients;
+}
 
-  return s3Client;
+export function resetS3ClientsForTests(): void {
+  cachedClients = null;
+}
+
+export async function headBucket(bucket: string): Promise<void> {
+  const { internal } = getS3Clients();
+  await internal.send(new HeadBucketCommand({ Bucket: bucket }));
 }
 
 export async function getSignedUploadUrl(
@@ -83,7 +113,7 @@ export async function getSignedUploadUrl(
   contentLength?: number,
 ): Promise<string> {
   const safePath = validatePath(path);
-  const s3 = getS3Client();
+  const { public: s3 } = getS3Clients();
   try {
     return await getS3SignedUrl(
       s3,
@@ -106,10 +136,10 @@ export async function getSignedUrl(
   expiresIn: number,
 ): Promise<string> {
   const safePath = validatePath(path);
-  const s3 = getS3Client();
+  const { internal } = getS3Clients();
   try {
     return await getS3SignedUrl(
-      s3,
+      internal,
       new GetObjectCommand({
         Bucket: bucket,
         Key: safePath,
@@ -121,15 +151,37 @@ export async function getSignedUrl(
   }
 }
 
+/** Signed URL against `S3_PUBLIC_ENDPOINT` (or `S3_ENDPOINT`), reachable by remote video providers. */
+export async function getPublicSignedUrl(
+  path: string,
+  bucket: string,
+  expiresIn: number,
+): Promise<string> {
+  const safePath = validatePath(path);
+  const { public: s3 } = getS3Clients();
+  try {
+    return await getS3SignedUrl(
+      s3,
+      new GetObjectCommand({
+        Bucket: bucket,
+        Key: safePath,
+      }),
+      { expiresIn },
+    );
+  } catch {
+    throw new Error("Could not generate public signed download URL");
+  }
+}
+
 export async function deleteObject(
   path: string,
   bucket: string,
 ): Promise<void> {
   const safePath = validatePath(path);
-  const s3 = getS3Client();
+  const { internal } = getS3Clients();
 
   try {
-    await s3.send(
+    await internal.send(
       new DeleteObjectCommand({
         Bucket: bucket,
         Key: safePath,
@@ -147,10 +199,10 @@ export async function putObject(
   contentType: string,
 ): Promise<void> {
   const safePath = validatePath(path);
-  const s3 = getS3Client();
+  const { internal } = getS3Clients();
 
   try {
-    await s3.send(
+    await internal.send(
       new PutObjectCommand({
         Bucket: bucket,
         Key: safePath,
@@ -168,10 +220,10 @@ export async function getObject(
   bucket: string,
 ): Promise<Uint8Array> {
   const safePath = validatePath(path);
-  const s3 = getS3Client();
+  const { internal } = getS3Clients();
 
   try {
-    const response = await s3.send(
+    const response = await internal.send(
       new GetObjectCommand({
         Bucket: bucket,
         Key: safePath,

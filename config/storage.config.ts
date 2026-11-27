@@ -1,7 +1,9 @@
-import { env } from "@/lib/env";
+import { getImagesBucketName } from "@/lib/env";
 
 export const storageConfig = {
   bucketNames: {
-    images: env.NEXT_PUBLIC_IMAGES_BUCKET_NAME,
+    get images(): string {
+      return getImagesBucketName();
+    },
   },
 };

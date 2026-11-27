@@ -1,0 +1,112 @@
+{
+  "provider": "openrouter",
+  "baseUrl": "https://openrouter.ai/api/v1",
+  "authHeader": {
+    "name": "Authorization",
+    "prefix": "Bearer "
+  },
+  "chatCompletions": {
+    "method": "POST",
+    "path": "/api/v1/chat/completions",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "id": "gen-or-123",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "{\"summary\":\"A quick product demo\"}"
+            },
+            "finish_reason": "stop"
+          }
+        ]
+      }
+    },
+    "errors": {
+      "auth": {
+        "status": 401,
+        "body": {
+          "error": {
+            "code": 401,
+            "message": "No auth credentials found"
+          }
+        }
+      },
+      "quota": {
+        "status": 402,
+        "body": {
+          "error": {
+            "code": 402,
+            "message": "Insufficient credits"
+          }
+        }
+      },
+      "moderation": {
+        "status": 403,
+        "body": {
+          "error": {
+            "code": 403,
+            "message": "Input flagged by moderation"
+          }
+        }
+      },
+      "rateLimited": {
+        "status": 429,
+        "headers": {
+          "Retry-After": "1"
+        },
+        "body": {
+          "error": {
+            "code": 429,
+            "message": "Rate limit exceeded"
+          }
+        }
+      },
+      "transient": {
+        "status": 503,
+        "body": {
+          "error": {
+            "code": 503,
+            "message": "Provider temporarily unavailable"
+          }
+        }
+      }
+    },
+    "malformedResponse": {
+      "status": 200,
+      "body": {
+        "choices": [
+          {
+            "message": {
+              "content": null
+            }
+          }
+        ]
+      }
+    }
+  },
+  "preflight": {
+    "method": "GET",
+    "path": "/api/v1/auth/key",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "data": {
+          "label": "test-key",
+          "limit_remaining": 10
+        }
+      }
+    },
+    "authErrorResponse": {
+      "status": 401,
+      "body": {
+        "error": {
+          "code": 401,
+          "message": "Invalid credentials"
+        }
+      }
+    }
+  }
+}

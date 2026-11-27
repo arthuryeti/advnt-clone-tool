@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   addVideoCloneTakes,
   buildTakes,
-  buildVideoCloneInput,
   continuityFrames,
+  estimateVideoCloneRenderUsd,
   hasTooManyCuts,
   keepsOriginal,
   layoutVideoCloneEdit,
+  normalizeVideoModelId,
   numberVideoCloneProducts,
+  renderSecondsForModel,
+  resolveTakePromptReferences,
   sayVideoCloneLines,
   settleDeadRenders,
   sharesContinuity,
@@ -99,28 +102,32 @@ describe("continuityFrames", () => {
   });
 });
 
-describe("buildVideoCloneInput", () => {
-  const take = {
-    seconds: 2.4,
-    analysis: { dialogue: [{ speaker: "a", text: "hi" }] },
+describe("resolveTakePromptReferences & canonical model helpers", () => {
+  const atImageDialect = {
+    formatImageToken: (slot: number) => `@image${slot}`,
+    maxImages: 30,
+    modelLabel: "Seedance 2.5",
+  };
+  const wanDialect = {
+    formatImageToken: (slot: number) => `Image${slot}`,
+    maxImages: 10,
+    modelLabel: "Wan 3.0",
   };
 
   it("numbers reference images in the order their tokens are wired", () => {
-    const input = buildVideoCloneInput(
-      take,
+    const resolved = resolveTakePromptReferences(
       "{{creator}} holds {{product}}; {{creator}} smiles. {{frame1}} shows her gown.",
       {
         creator: "https://img/creator.jpg",
         products: ["https://img/product.jpg"],
         frames: ["https://img/frame.jpg"],
       },
-      "bytedance/seedance-2-5",
-      "kie",
+      atImageDialect,
     );
-    expect(input.prompt).toBe(
+    expect(resolved.prompt).toBe(
       "@image1 holds @image2; @image1 smiles. @image3 shows her gown.",
     );
-    expect(input).toHaveProperty("reference_image_urls", [
+    expect(resolved.imageUrls).toEqual([
       "https://img/creator.jpg",
       "https://img/product.jpg",
       "https://img/frame.jpg",
@@ -128,8 +135,7 @@ describe("buildVideoCloneInput", () => {
   });
 
   it("sends only the products a take mentions, in order of mention", () => {
-    const input = buildVideoCloneInput(
-      take,
+    const resolved = resolveTakePromptReferences(
       "{{product3}} next to {{product1}}, then {{product3}} and {{product11}}.",
       {
         creator: "https://img/creator.jpg",
@@ -139,21 +145,19 @@ describe("buildVideoCloneInput", () => {
           "https://img/p3.jpg",
         ],
       },
-      "bytedance/seedance-2-5",
-      "kie",
+      atImageDialect,
     );
-    expect(input.prompt).toBe(
+    expect(resolved.prompt).toBe(
       "@image1 next to @image2, then @image1 and the product.",
     );
-    expect(input).toHaveProperty("reference_image_urls", [
+    expect(resolved.imageUrls).toEqual([
       "https://img/p3.jpg",
       "https://img/p1.jpg",
     ]);
   });
 
   it("wires recast characters, sending an avatar once when it plays two parts", () => {
-    const input = buildVideoCloneInput(
-      take,
+    const resolved = resolveTakePromptReferences(
       "{{cast:guest_1}} asks {{creator}}; {{cast:host}} laughs.",
       {
         creator: "https://img/ava.jpg",
@@ -163,19 +167,17 @@ describe("buildVideoCloneInput", () => {
         ]),
         products: [],
       },
-      "bytedance/seedance-2-5",
-      "kie",
+      atImageDialect,
     );
-    expect(input.prompt).toBe("@image1 asks @image2; @image2 laughs.");
-    expect(input).toHaveProperty("reference_image_urls", [
+    expect(resolved.prompt).toBe("@image1 asks @image2; @image2 laughs.");
+    expect(resolved.imageUrls).toEqual([
       "https://img/bob.jpg",
       "https://img/ava.jpg",
     ]);
   });
 
-  it("writes a person or product without an image as its plan description, and still meets Seedance's 4s minimum", () => {
-    const input = buildVideoCloneInput(
-      take,
+  it("writes a person or product without an image as its plan description", () => {
+    const resolved = resolveTakePromptReferences(
       "{{creator}} holds {{product}}; {{cast:guest}} nods at {{cast:extra}}.",
       {
         products: [],
@@ -189,117 +191,59 @@ describe("buildVideoCloneInput", () => {
         ],
         product: { present: true, description: "Pale pink lace bra." },
       },
-      "bytedance/seedance-2-5",
-      "kie",
+      atImageDialect,
     );
-    expect(input.prompt).toBe(
+    expect(resolved.prompt).toBe(
       "Blonde woman in a cowboy hat holds Pale pink lace bra; Man in a red cap nods at the person.",
     );
-    expect(input).not.toHaveProperty("reference_image_urls");
-    expect(input).toMatchObject({ duration: 4, generate_audio: true });
+    expect(resolved.imageUrls).toEqual([]);
+    expect(renderSecondsForModel(2.4, 4, 30)).toBe(4);
   });
 
-  it("speaks each model's KIE dialect: Seedance draft @imageN, Wan ImageN at 480P", () => {
-    const references = {
-      creator: "https://img/creator.jpg",
-      products: ["https://img/product.jpg"],
-    };
-    const prompt = "{{creator}} holds {{product}}.";
-    expect(
-      buildVideoCloneInput(
-        take,
-        prompt,
-        references,
-        "bytedance/seedance-2-5",
-        "kie",
-      ),
-    ).toMatchObject({ draft: true, resolution: "480p", generate_audio: true });
-    const wan = buildVideoCloneInput(
-      take,
-      prompt,
-      references,
-      "wan/3-0-video",
-      "kie",
+  it("formats custom model token dialects and refuses excess reference images", () => {
+    const wan = resolveTakePromptReferences(
+      "{{creator}} holds {{product}}.",
+      {
+        creator: "https://img/creator.jpg",
+        products: ["https://img/product.jpg"],
+      },
+      wanDialect,
     );
-    expect(wan).toEqual({
-      prompt: "Image1 holds Image2.",
-      reference_image_urls: [
-        "https://img/creator.jpg",
-        "https://img/product.jpg",
-      ],
-      duration: 4,
-      aspect_ratio: "9:16",
-      resolution: "480P",
-      audio: true,
-    });
-  });
+    expect(wan.prompt).toBe("Image1 holds Image2.");
 
-  it("sends Revana one input shape, keeping each model's image names", () => {
-    const references = {
-      creator: "https://img/creator.jpg",
-      products: ["https://img/product.jpg"],
-    };
-    const prompt = "{{creator}} holds {{product}}.";
-    const shape = {
-      image_urls: ["https://img/creator.jpg", "https://img/product.jpg"],
-      duration: 4,
-      aspect_ratio: "9:16",
-      resolution: "480p",
-      audio: true,
-    };
-    expect(
-      buildVideoCloneInput(
-        take,
-        prompt,
-        references,
-        "bytedance/seedance-2-5",
-        "revana",
-      ),
-    ).toEqual({ prompt: "@image1 holds @image2.", ...shape });
-    expect(
-      buildVideoCloneInput(take, prompt, references, "wan/3-0-video", "revana"),
-    ).toEqual({ prompt: "Image1 holds Image2.", ...shape });
-  });
-
-  it("sends Sume one input shape, keeping each model's image names", () => {
-    const references = {
-      creator: "https://img/creator.jpg",
-      products: ["https://img/product.jpg"],
-    };
-    const prompt = "{{creator}} holds {{product}}.";
-    const shape = {
-      reference_image_urls: [
-        "https://img/creator.jpg",
-        "https://img/product.jpg",
-      ],
-      duration: 4,
-      aspect_ratio: "9:16",
-      resolution: "480p",
-      generate_audio: true,
-    };
-    expect(
-      buildVideoCloneInput(
-        take,
-        prompt,
-        references,
-        "bytedance/seedance-2-5",
-        "sume",
-      ),
-    ).toEqual({ prompt: "@image1 holds @image2.", ...shape });
-    expect(
-      buildVideoCloneInput(take, prompt, references, "wan/3-0-video", "sume"),
-    ).toEqual({ prompt: "Image1 holds Image2.", ...shape });
-  });
-
-  it("refuses a take with more reference images than Wan takes", () => {
     const products = Array.from(
       { length: 11 },
       (_, i) => `https://img/p${i}.jpg`,
     );
     const prompt = products.map((_, i) => `{{product${i + 1}}}`).join(" ");
     expect(() =>
-      buildVideoCloneInput(take, prompt, { products }, "wan/3-0-video", "kie"),
+      resolveTakePromptReferences(prompt, { products }, wanDialect),
     ).toThrow("up to 10 reference images");
+  });
+
+  it("normalizes legacy KIE model aliases and computes capability-based pricing", () => {
+    expect(normalizeVideoModelId("bytedance/seedance-2-5")).toBe(
+      "seedance-2.5",
+    );
+    expect(normalizeVideoModelId("wan/3-0-video")).toBe("wan-3.0");
+    expect(normalizeVideoModelId(undefined)).toBe("seedance-2.5");
+
+    const usd = estimateVideoCloneRenderUsd(
+      [
+        { seconds: 2.4, model: "bytedance/seedance-2-5" },
+        { seconds: 3.2, model: "wan/3-0-video" },
+      ],
+      [
+        {
+          id: "seedance-2.5",
+          minSeconds: 4,
+          maxSeconds: 30,
+          usdPerSecond: 0.14,
+        },
+        { id: "wan-3.0", minSeconds: 2, maxSeconds: 30, usdPerSecond: 0.04 },
+      ],
+    );
+    expect(usd).toBeCloseTo(4 * 0.14 + 4 * 0.04);
   });
 });
 

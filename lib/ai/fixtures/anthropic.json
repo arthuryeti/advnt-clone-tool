@@ -1,0 +1,162 @@
+{
+  "provider": "anthropic",
+  "baseUrl": "https://api.anthropic.com",
+  "authHeader": {
+    "name": "x-api-key",
+    "prefix": ""
+  },
+  "messages": {
+    "method": "POST",
+    "path": "/v1/messages",
+    "headers": {
+      "anthropic-version": "2023-06-01"
+    },
+    "requestBody": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 8192,
+      "system": "System instructions",
+      "tools": [
+        {
+          "name": "submit_structured_output",
+          "description": "Return structured output matching the schema.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "summary": { "type": "string" }
+            },
+            "required": ["summary"]
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "tool",
+        "name": "submit_structured_output"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "image",
+              "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": "/9j/4AAQ"
+              }
+            },
+            {
+              "type": "text",
+              "text": "Summarize"
+            }
+          ]
+        }
+      ]
+    },
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_123",
+            "name": "submit_structured_output",
+            "input": {
+              "summary": "A quick product demo"
+            }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    "errors": {
+      "auth": {
+        "status": 401,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "authentication_error",
+            "message": "invalid x-api-key"
+          }
+        }
+      },
+      "quota": {
+        "status": 400,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "invalid_request_error",
+            "message": "Your credit balance is too low to access the Anthropic API"
+          }
+        }
+      },
+      "moderation": {
+        "status": 400,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "invalid_request_error",
+            "message": "Output blocked by content filtering safety policy"
+          }
+        }
+      },
+      "rateLimited": {
+        "status": 429,
+        "headers": {
+          "retry-after": "1"
+        },
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "rate_limit_error",
+            "message": "Number of request tokens has exceeded your rate limit"
+          }
+        }
+      },
+      "transient": {
+        "status": 529,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "overloaded_error",
+            "message": "Overloaded"
+          }
+        }
+      }
+    },
+    "malformedResponse": {
+      "status": 200,
+      "body": {
+        "id": "msg_124",
+        "content": [
+          {
+            "type": "text",
+            "text": "not tool use"
+          }
+        ]
+      }
+    }
+  },
+  "preflight": {
+    "method": "GET",
+    "path": "/v1/models?limit=1",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "data": [{ "id": "claude-sonnet-4-5" }]
+      }
+    },
+    "authErrorResponse": {
+      "status": 401,
+      "body": {
+        "type": "error",
+        "error": {
+          "type": "authentication_error",
+          "message": "invalid x-api-key"
+        }
+      }
+    }
+  }
+}

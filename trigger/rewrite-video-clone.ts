@@ -2,13 +2,11 @@ import type { z } from "zod/v4";
 import { applyVideoCloneChanges } from "@/lib/ai/adapt-video-clone-prompts";
 import { rewriteVideoCloneInputSchema } from "@/lib/content-workflows/video-clone";
 import {
-  addVideoCloneTakesToPlan,
+  applyAtomicRewritePlan,
   findProductImages,
   findVideoClone,
+  requestVideoCloneStitch,
   setVideoCloneRewrite,
-  setVideoCloneTakeTiming,
-  startVideoCloneStitch,
-  updateVideoCloneTake,
 } from "@/lib/content-workflows/video-clone-store";
 import { schemaTask } from "@/lib/jobs";
 import { resolveStorageDownloadUrl } from "@/lib/storage";
@@ -16,10 +14,7 @@ import { getErrorMessage } from "@/lib/utils";
 import { triggerTaskIds } from "./shared";
 
 /**
- * Applies a toolbar change to a clone plan (applyVideoCloneChanges): rewritten prompts, lines,
- * and timing, the takes it adds, and the added takes it writes again. A script grown by minutes
- * takes minutes, so it runs in the background and the page follows `structure.video.rewrite`.
- * Nothing renders. Never retried: a failure shows on the page instead.
+ * Applies a toolbar change to a clone plan atomically inside a locked row transaction.
  */
 export const rewriteVideoCloneTask = schemaTask({
   id: triggerTaskIds.rewriteVideoClone,
@@ -71,59 +66,22 @@ async function rewriteVideoClone(
     changes: payload.changes,
     product,
   });
-  // Merged-away takes shift the positions renders write to: never while one runs.
-  if (addition?.removed.length) {
-    const now = await findVideoClone(payload.organizationId, plan.id);
-    if (
-      now?.video.takes.some((take) =>
-        [take.generation, ...take.parts.map((part) => part.generation)].some(
-          (generation) => generation?.status === "generating",
-        ),
-      )
-    ) {
-      throw new Error(
-        "This change merges takes; wait for the renders to finish, then submit it again.",
-      );
-    }
-  }
-  // ponytail: one write per changed take; a plan has a handful.
-  for (const { index, prompt, dialogue, parts } of takes) {
-    const result = await updateVideoCloneTake(payload.organizationId, {
-      templateId: plan.id,
-      takeIndex: index,
-      prompt,
-      dialogue: dialogue ?? undefined,
-    });
-    if ("error" in result) throw new Error(result.error);
-    // Positions hold: takes are only appended meanwhile (removing one waits for this).
-    if (parts) {
-      await setVideoCloneTakeTiming(
-        plan.id,
-        plan.video.takes.findIndex((take) => take.index === index),
-        parts,
-      );
-    }
-  }
-  // Takes written again replace theirs, render included.
+
+  await applyAtomicRewritePlan(plan.id, { takes, addition });
+
   const rewritten =
     addition?.takes.filter((take) =>
       plan.video.takes.some((item) => item.index === take.index),
     ) ?? [];
   const added =
     addition?.takes.filter((take) => !rewritten.includes(take)) ?? [];
-  if (addition) {
-    await addVideoCloneTakesToPlan(plan.id, plan.video.takes, addition);
-  }
+
   if (
     [...rewritten.map((take) => take.index), ...(addition?.removed ?? [])].some(
       (index) => plan.video.edit?.rendered.includes(index),
     )
   ) {
-    await startVideoCloneStitch(
-      payload.organizationId,
-      plan.id,
-      plan.video.edit,
-    );
+    await requestVideoCloneStitch(payload.organizationId, plan.id);
   }
   return {
     summary,

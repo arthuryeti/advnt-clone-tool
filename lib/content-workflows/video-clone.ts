@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+
 /** Seedance 2.5 renders 4-30s per generation (Wan 3.0 2-30s); takes are planned for Seedance. */
 export const SEEDANCE_MIN_SECONDS = 4;
 export const MAX_TAKE_SECONDS = 30;
@@ -13,52 +14,29 @@ export const VIDEO_CLONE_VERDICTS = ["clone", "skip"] as const;
 export type VideoCloneVerdict = (typeof VIDEO_CLONE_VERDICTS)[number];
 /** Product photos one render can reference (Seedance takes up to 30 images). */
 export const MAX_VIDEO_CLONE_PRODUCTS = 10;
-/** Video models a take can render with; both take a prompt plus reference images. */
-export const VIDEO_CLONE_MODEL_IDS = [
-  "bytedance/seedance-2-5",
-  "wan/3-0-video",
-] as const;
-export type VideoCloneModel = (typeof VIDEO_CLONE_MODEL_IDS)[number];
-export const DEFAULT_VIDEO_CLONE_MODEL: VideoCloneModel =
-  "bytedance/seedance-2-5";
-/** Who renders takes (VIDEO_PROVIDER); KIE unless set to another. */
-export const VIDEO_PROVIDERS = ["kie", "revana", "sume"] as const;
-export type VideoProvider = (typeof VIDEO_PROVIDERS)[number];
-export const DEFAULT_VIDEO_PROVIDER: VideoProvider = "kie";
-export const VIDEO_PROVIDER_LABELS: Record<VideoProvider, string> = {
-  kie: "KIE",
-  revana: "Revana",
-  sume: "Sume",
+
+/** Canonical model identifiers stored in clone plans, decoupled from provider-specific slugs. */
+export const DEFAULT_VIDEO_MODEL_ID = "seedance-2.5";
+export const LEGACY_VIDEO_MODEL_ALIASES: Record<string, string> = {
+  "bytedance/seedance-2-5": "seedance-2.5",
+  "wan/3-0-video": "wan-3.0",
 };
-/**
- * Stored ids (KIE's model ids, as saved on plans) → Revana's and Sume's model ids, each
- * provider's 480p price per second without video input, and the reference image limit.
- */
-export const VIDEO_CLONE_MODELS: Record<
-  VideoCloneModel,
-  {
-    label: string;
-    revanaId: string;
-    sumeId: string;
-    usdPerSecond: Record<VideoProvider, number>;
-    maxImages: number;
-  }
-> = {
-  "bytedance/seedance-2-5": {
-    label: "Seedance 2.5",
-    revanaId: "seedance-2.5",
-    sumeId: "seedance-2.5",
-    // KIE's is draft mode; Revana and Sume have no draft, so their 480p is the full render.
-    usdPerSecond: { kie: 0.14, revana: 0.11, sume: 0.1028 },
-    maxImages: 30,
-  },
-  "wan/3-0-video": {
-    label: "Wan 3.0",
-    revanaId: "wan-3.0",
-    sumeId: "wan-3.0",
-    usdPerSecond: { kie: 0.04, revana: 0.05, sume: 0.05 },
-    maxImages: 10,
-  },
+
+export type VideoCloneModel = string;
+
+/** Normalizes legacy provider-prefixed model slugs onto canonical model IDs. */
+export function normalizeVideoModelId(model?: string | null): string {
+  const trimmed = model?.trim();
+  if (!trimmed) return DEFAULT_VIDEO_MODEL_ID;
+  return LEGACY_VIDEO_MODEL_ALIASES[trimmed] ?? trimmed;
+}
+
+export type VideoModelPricingSpec = {
+  id: string;
+  aliases?: readonly string[];
+  minSeconds: number;
+  maxSeconds: number;
+  usdPerSecond: number;
 };
 
 // The .describe() texts double as Gemini instructions: these schemas are its response formats.
@@ -152,16 +130,20 @@ export type VideoCloneTakeAnalysis = z.infer<
 
 export const videoCloneGenerationSchema = z.object({
   status: z.enum(["generating", "done", "failed"]),
-  /** What Seedance received: after the requested changes and reference wiring. */
+  /** What the video model received: after the requested changes and reference wiring. */
   prompt: z.string(),
   videoUrl: z.string().optional(),
   error: z.string().optional(),
-  /** Character id → the account whose avatar played them. Absent on renders made before these were recorded. */
+  /** Character id -> the face that played them. Absent on renders made before these were recorded. */
   cast: z.record(z.string(), z.string().uuid()).optional(),
   changes: z.string(),
   productFolder: z.string().nullable().optional(),
-  /** Absent on renders made before takes had a model: those were Seedance 2.5. */
-  model: z.enum(VIDEO_CLONE_MODEL_IDS).optional(),
+  /** Canonical model ID used for this render. */
+  model: z.string().min(1).max(120).optional(),
+  /** Provider plugin ID that executed this render. */
+  providerId: z.string().min(1).max(80).optional(),
+  /** Durable render_attempts ID linking this generation to Postgres reconciliation. */
+  attemptId: z.string().uuid().optional(),
   /**
    * Parts (by shot) this render stages differently from the original: another action, camera
    * side, or listener (checkVideoCloneRender). Absent = not checked.
@@ -179,7 +161,7 @@ const videoClonePartSchema = z.object({
   /** Where the part sits in the original video. */
   srcStart: z.number(),
   srcEnd: z.number(),
-  /** Where the part sits inside its take (the one Seedance generation); longer than its source when extended. */
+  /** Where the part sits inside its take (the one generation); longer than its source when extended. */
   takeStart: z.number(),
   takeEnd: z.number(),
   /** This part rendered alone, replacing its piece of the take's render. Cleared when the take renders again. */
@@ -248,8 +230,8 @@ export const videoCloneSchema = z.object({
         .array(z.string().uuid())
         .max(MAX_VIDEO_CLONE_PRODUCTS)
         .optional(),
-      /** The model the next render uses; absent = DEFAULT_VIDEO_CLONE_MODEL. */
-      model: z.enum(VIDEO_CLONE_MODEL_IDS).optional(),
+      /** Canonical model ID the next render uses; absent = active provider's default. */
+      model: z.string().min(1).max(120).optional(),
       /** Not rendered: the edit uses the original's footage. Absent = only manual takes; see keepsOriginal. */
       keepOriginal: z.boolean().optional(),
       /** The render the edit uses: the latest, unless an earlier one was picked back. */
@@ -284,6 +266,8 @@ export const videoCloneSchema = z.object({
   edit: z
     .object({
       status: z.enum(["stitching", "done", "failed"]),
+      /** Monotonic revision counter to prevent stale stitch commits from overwriting newer edits. */
+      revision: z.number().int().optional(),
       /** Kept while a re-stitch runs, so the last edit stays watchable. */
       videoUrl: z.string().optional(),
       /** The same edit with the takes' on-screen text burned in (videoCloneTextOverlays), for downloads and posts when `burnText` is on; absent when it has none. */
@@ -326,7 +310,7 @@ export const generateVideoCloneInputSchema = z.object({
   organizationId: z.string().uuid(),
   templateId: z.string().uuid(),
   takeIndexes: z.array(z.number().int().positive()).min(1).max(60),
-  /** Character id (the plan's vibe.characters) → the face (faces table) that plays them; the rest keep their description. */
+  /** Character id (the plan's vibe.characters) -> the face (faces table) that plays them; the rest keep their description. */
   cast: z.record(z.string().max(100), z.string().uuid()).default({}),
   /** Free-text edits for every selected take: the script ("reword it", "a new script"), setting, wardrobe... */
   changes: z.string().trim().max(2000),
@@ -356,7 +340,7 @@ export const videoCloneTakeEditSchema = z.object({
   prompt: z.string().trim().min(1).max(10_000).optional(),
   dialogue: videoCloneTakeAnalysisSchema.shape.dialogue.max(100).optional(),
   products: z.array(z.string().uuid()).max(MAX_VIDEO_CLONE_PRODUCTS).optional(),
-  model: z.enum(VIDEO_CLONE_MODEL_IDS).optional(),
+  model: z.string().trim().min(1).max(120).optional(),
   keepOriginal: z.boolean().optional(),
 });
 
@@ -436,7 +420,7 @@ export type PlannedTake = {
 };
 
 /**
- * One take = one Seedance generation. A video that fits one generation (30s) renders as one
+ * One take = one video generation. A video that fits one generation (30s) renders as one
  * take in story order: separate generations drift apart (outfits, faces, sets), even inside
  * one plan. Longer videos group a scene's shots (same place, same moment) in one take in
  * story order, so people, location, and voices match. Takes under Seedance's 4s minimum
@@ -509,26 +493,48 @@ export function buildTakes(
   return toTakes(packed);
 }
 
+/** The seconds a take is rendered (and billed) for within a model's bounds. */
+export const renderSecondsForModel = (
+  seconds: number,
+  minSeconds = SEEDANCE_MIN_SECONDS,
+  maxSeconds = MAX_TAKE_SECONDS,
+) => Math.min(maxSeconds, Math.max(minSeconds, Math.ceil(seconds)));
+
 /** The seconds a take is rendered (and billed) for: its length rounded up, 4s minimum. */
 export const renderSeconds = (seconds: number) =>
-  Math.min(
-    MAX_TAKE_SECONDS,
-    Math.max(SEEDANCE_MIN_SECONDS, Math.ceil(seconds)),
-  );
+  renderSecondsForModel(seconds, SEEDANCE_MIN_SECONDS, MAX_TAKE_SECONDS);
 
-/** What rendering these takes costs on the provider, in USD: each take's seconds rounded up at its model's price. */
-export function videoCloneRenderUsd(
-  takes: { seconds: number; model?: VideoCloneModel | null }[],
-  provider: VideoProvider,
-): number {
-  return takes.reduce(
-    (sum, take) =>
-      sum +
-      renderSeconds(take.seconds) *
-        VIDEO_CLONE_MODELS[take.model ?? DEFAULT_VIDEO_CLONE_MODEL]
-          .usdPerSecond[provider],
-    0,
+function findPricingSpec(
+  models: readonly VideoModelPricingSpec[],
+  modelId: string | null | undefined,
+  defaultModelId: string,
+): VideoModelPricingSpec | undefined {
+  const normalized = normalizeVideoModelId(modelId ?? defaultModelId);
+  return (
+    models.find(
+      (item) =>
+        item.id === normalized ||
+        item.aliases?.includes(modelId ?? "") ||
+        item.aliases?.includes(normalized),
+    ) ?? models.find((item) => item.id === defaultModelId)
   );
+}
+
+/** Estimates USD render cost using provider-declared model capabilities and per-second rates. */
+export function estimateVideoCloneRenderUsd(
+  takes: { seconds: number; model?: string | null }[],
+  models: readonly VideoModelPricingSpec[],
+  defaultModelId = DEFAULT_VIDEO_MODEL_ID,
+): number {
+  return takes.reduce((sum, take) => {
+    const spec = findPricingSpec(models, take.model, defaultModelId);
+    if (!spec) return sum;
+    return (
+      sum +
+      renderSecondsForModel(take.seconds, spec.minSeconds, spec.maxSeconds) *
+        spec.usdPerSecond
+    );
+  }, 0);
 }
 
 /** Gemini judges content; packing many cuts into one take is a difficulty it can't see. */
@@ -623,37 +629,33 @@ export function numberVideoCloneProducts<Image extends { url: string }>(
   return { products, pinned };
 }
 
+export type TakePromptReferences = {
+  creator?: string;
+  /** Character id -> avatar URL. */
+  cast?: Map<string, string>;
+  products: string[];
+  /** Frames of earlier renders this take must match (continuityFrames). */
+  frames?: string[];
+  /** The plan's characters, for the people without an image. */
+  characters?: Omit<VideoCloneVibe["characters"][number], "role">[];
+  /** The original's product, for a product without an image. */
+  product?: VideoCloneVibe["product"];
+};
+
 /**
- * The KIE, Revana, or Sume input for one take. Both models name reference images by position in the prompt
- * (Seedance `@image1`, Wan `Image1` for the first URL), so each image gets the next slot in
- * order of first mention, and a take only sends the images it uses. `{{creator}}` is the plan's
- * main person, `{{cast:<id>}}` any other character we recast, `{{product}}` (the plan's word for
- * the original's product) our first product, `{{frameN}}` the Nth continuity frame. A token
- * without an image falls back to words: a person to their plan description (the prompts leave
- * out the creator's face and hair, so without it they'd be a different person in every take),
- * a product to the original's (or else Seedance invents one: a silver lump instead of a bra).
- * Throws when the take uses more images than the model takes.
+ * Resolves `{{creator}}`, `{{cast:<id>}}`, `{{productN}}`, and `{{frameN}}` tokens in a take's
+ * prompt against available reference image URLs and formats slots using the active model's
+ * token dialect. Dedupes URLs in order of first mention and enforces the model's `maxImages`.
  */
-export function buildVideoCloneInput(
-  take: { seconds: number; analysis: { dialogue: unknown[] } },
+export function resolveTakePromptReferences(
   prompt: string,
-  references: {
-    creator?: string;
-    /** Character id → avatar URL. */
-    cast?: Map<string, string>;
-    products: string[];
-    /** Frames of earlier renders this take must match (continuityFrames). */
-    frames?: string[];
-    /** The plan's characters, for the people without an image. */
-    characters?: Omit<VideoCloneVibe["characters"][number], "role">[];
-    /** The original's product, for a product without an image. */
-    product?: VideoCloneVibe["product"];
+  references: TakePromptReferences,
+  dialect: {
+    formatImageToken: (slot: number) => string;
+    maxImages: number;
+    modelLabel: string;
   },
-  model: VideoCloneModel,
-  provider: VideoProvider,
-) {
-  const { label, maxImages } = VIDEO_CLONE_MODELS[model];
-  const wan = model === "wan/3-0-video";
+): { prompt: string; imageUrls: string[] } {
   const imageUrls: string[] = [];
   // Keyed by URL: the same avatar playing two characters is one reference image.
   const slots = new Map<string, string>();
@@ -662,14 +664,8 @@ export function buildVideoCloneInput(
     .replace(
       /\{\{(creator|cast:([\w-]+)|product(\d+)|frame(\d+))\}\}/gu,
       (_token, name: string, castId?: string, n?: string, frame?: string) => {
-        let url = frame
-          ? references.frames?.[Number(frame) - 1]
-          : references.products[Number(n) - 1];
-        let fallback = frame
-          ? "an earlier shot"
-          : references.product?.present
-            ? references.product.description.replace(/[.\s]+$/u, "")
-            : "the product";
+        let url: string | undefined;
+        let fallback: string;
         if (name === "creator" || castId) {
           url = castId ? references.cast?.get(castId) : references.creator;
           const person = references.characters?.find((character) =>
@@ -679,55 +675,34 @@ export function buildVideoCloneInput(
           );
           fallback =
             person?.description.replace(/[.\s]+$/u, "") ?? "the person";
+        } else if (frame) {
+          url = references.frames?.[Number(frame) - 1];
+          fallback = "an earlier shot";
+        } else {
+          url = references.products[Number(n) - 1];
+          fallback = references.product?.present
+            ? references.product.description.replace(/[.\s]+$/u, "")
+            : "the product";
         }
+
         if (!url) return fallback;
         let slot = slots.get(url);
         if (!slot) {
           imageUrls.push(url);
-          slot = wan ? `Image${imageUrls.length}` : `@image${imageUrls.length}`;
+          slot = dialect.formatImageToken(imageUrls.length);
           slots.set(url, slot);
         }
         return slot;
       },
     );
-  if (imageUrls.length > maxImages) {
+
+  if (imageUrls.length > dialect.maxImages) {
     throw new Error(
-      `${label} takes up to ${maxImages} reference images; this take uses ${imageUrls.length}.`,
+      `${dialect.modelLabel} takes up to ${dialect.maxImages} reference images; this take uses ${imageUrls.length}.`,
     );
   }
-  const shared = {
-    prompt: text,
-    duration: renderSeconds(take.seconds),
-    aspect_ratio: "9:16",
-  };
-  const speaks = take.analysis.dialogue.length > 0;
-  const images = imageUrls.length > 0;
-  // Revana takes one input shape for every model.
-  if (provider === "revana") {
-    return {
-      ...shared,
-      ...(images ? { image_urls: imageUrls } : {}),
-      resolution: "480p",
-      audio: speaks,
-    };
-  }
-  // Sume takes one input shape for every model, named like KIE's Seedance.
-  if (provider === "sume") {
-    return {
-      ...shared,
-      ...(images ? { reference_image_urls: imageUrls } : {}),
-      resolution: "480p",
-      generate_audio: speaks,
-    };
-  }
-  const kie = {
-    ...shared,
-    ...(images ? { reference_image_urls: imageUrls } : {}),
-  };
-  return wan
-    ? { ...kie, resolution: "480P", audio: speaks }
-    : // Draft mode is Seedance 2.5's cheap 480p on KIE.
-      { ...kie, resolution: "480p", draft: true, generate_audio: speaks };
+
+  return { prompt: text, imageUrls };
 }
 
 // A take prompt's part labels: "Part 2 (5.9-12.1s):".
@@ -864,7 +839,7 @@ export const keepsOriginal = (take: {
 /**
  * The plan with renders and stitches whose run died without saying so (a canceled or crashed run
  * never reaches its catch) marked failed, so they can run again. A live run renders its takes in
- * rounds, each ≤45 minutes, then stitches: an hour per take, plus one, bounds it.
+ * rounds, each <=45 minutes, then stitches: an hour per take, plus one, bounds it.
  */
 export function settleDeadRenders(video: VideoClone, now = Date.now()) {
   const cutoff = now - (video.takes.length + 1) * 60 * 60 * 1000;
@@ -992,7 +967,7 @@ export const isAddedPart = (part: { srcStart: number; srcEnd: number }) =>
 
 /**
  * The video as it plays now: every part in story order (`story`, else the original's), each at
- * its planned length (takeStart–takeEnd) on the story clock (`start`–`end`).
+ * its planned length (takeStart-takeEnd) on the story clock (`start`-`end`).
  */
 export function videoCloneStory<Part extends VideoClonePart>(plan: {
   story?: number[];
@@ -1124,7 +1099,7 @@ export function addVideoCloneTakes<Analysis>(
   });
   const order = story.map(({ shot }) => shot);
   const anchors = new Map(story.map((slot) => [slot.shot, slot.srcEnd]));
-  /** Shot `after` → the last shot added behind it so far, so takes keep the order given. */
+  /** Shot `after` -> the last shot added behind it so far, so takes keep the order given. */
   const behind = new Map<number, number>();
   const continuity = plan.continuity?.map((element) => ({
     ...element,
@@ -1206,11 +1181,11 @@ export function layoutVideoCloneEdit(
     story?: number[];
     takes: { index: number; parts: VideoClonePart[] }[];
   },
-  /** Take index → its render's cuts. */
+  /** Take index -> its render's cuts. */
   renders: Map<number, RenderCuts>,
-  /** Shot → the length of its part's own render, for parts redone alone. */
+  /** Shot -> the length of its part's own render, for parts redone alone. */
   redone = new Map<number, number>(),
-  /** Shot → the cuts of the earlier take render picked for it (`takeRender`). */
+  /** Shot -> the cuts of the earlier take render picked for it (`takeRender`). */
   picked = new Map<number, RenderCuts>(),
 ) {
   const spans = new Map(
@@ -1252,7 +1227,7 @@ export function layoutVideoCloneEdit(
 }
 
 /**
- * The file each part of the edit plays from: take index → its render (`takes`), shot → its own
+ * The file each part of the edit plays from: take index -> its render (`takes`), shot -> its own
  * render (`redone`) or the earlier take render picked for it (`picked`). Takes that keep the
  * original have none.
  */
@@ -1276,7 +1251,7 @@ export function videoCloneEditSources(plan: { takes: VideoClone["takes"] }) {
   return { takes, redone, picked };
 }
 
-/** A part where it plays in the edit (`editStart`–`editEnd`), cut from `src` (none = the original) between `start` and `end`. */
+/** A part where it plays in the edit (`editStart`-`editEnd`), cut from `src` (none = the original) between `start` and `end`. */
 export type VideoCloneEditClip = {
   take: number;
   part: VideoClonePart & { take: number; start: number; end: number };

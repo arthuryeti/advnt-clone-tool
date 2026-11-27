@@ -1,17 +1,24 @@
 import "server-only";
 
-import { and, asc, desc, eq, inArray, ne, type SQL, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import type { z } from "zod/v4";
 import { storageConfig } from "@/config/storage.config";
-import { getVideoProvider } from "@/lib/ai/video-provider";
+import {
+  resolveActiveVideoProvider,
+  resolveModelForProvider,
+} from "@/lib/ai/video-provider";
 import { db } from "@/lib/db";
 import {
+  backgroundJobTable,
   contentTemplateTable,
   creativeAssetFolderTable,
   creativeAssetTable,
   faceTable,
+  renderAttemptTable,
 } from "@/lib/db/schema";
-import { getSignedUploadUrl } from "@/lib/storage";
+import { getWorkerId, resumeRunInProcess } from "@/lib/jobs";
+import { runPreflight } from "@/lib/preflight";
+import { getPublicSignedUrl, getSignedUploadUrl } from "@/lib/storage";
 import { getErrorMessage } from "@/lib/utils";
 import type { analyzeVideoCloneTask } from "@/trigger/analyze-video-clone";
 import type { generateVideoCloneTask } from "@/trigger/generate-video-clone";
@@ -22,6 +29,7 @@ import {
   type generateVideoCloneInputSchema,
   keepsOriginal,
   MAX_VIDEO_CLONE_PRODUCTS,
+  type RenderCuts,
   type rewriteVideoCloneInputSchema,
   settleDeadRenders,
   type VideoClone,
@@ -34,199 +42,436 @@ import {
 } from "./video-clone";
 
 /**
- * Writes one field of one take in a single statement, so takes finishing at the same time
- * (or a regenerate racing a full run) never overwrite each other's results.
+ * Runs `fn` inside a Postgres transaction holding a `FOR UPDATE` row lock on the clone template,
+ * eliminating positional `jsonb_set` races and concurrent overwrite hazards.
  */
-async function setTakeField(
+export async function withLockedCloneTemplate<T>(
   templateId: string,
-  takePosition: number,
-  field: string,
-  value: unknown,
-): Promise<void> {
-  await db
-    .update(contentTemplateTable)
-    .set({
-      structure: sql`jsonb_set(${contentTemplateTable.structure}, ${`{video,takes,${takePosition},${field}}`}::text[], ${JSON.stringify(value)}::jsonb)`,
-    })
-    .where(eq(contentTemplateTable.id, templateId));
+  fn: (
+    video: VideoClone,
+    row: { id: string; organizationId: string; name: string },
+  ) => Promise<{ result: T; nextVideo?: VideoClone }>,
+  organizationId?: string,
+): Promise<T | null> {
+  return db.transaction(async (tx) => {
+    const whereClause = organizationId
+      ? and(
+          eq(contentTemplateTable.id, templateId),
+          eq(contentTemplateTable.organizationId, organizationId),
+        )
+      : eq(contentTemplateTable.id, templateId);
+
+    const rows = await tx
+      .select({
+        id: contentTemplateTable.id,
+        organizationId: contentTemplateTable.organizationId,
+        name: contentTemplateTable.name,
+        structure: contentTemplateTable.structure,
+      })
+      .from(contentTemplateTable)
+      .where(whereClause)
+      .for("update");
+
+    const row = rows[0];
+    const video = row?.structure.video;
+    if (!row || !video) return null;
+
+    const { result, nextVideo } = await fn(structuredClone(video), {
+      id: row.id,
+      organizationId: row.organizationId,
+      name: row.name,
+    });
+
+    if (nextVideo) {
+      await tx
+        .update(contentTemplateTable)
+        .set({
+          structure: { ...row.structure, video: nextVideo },
+        })
+        .where(eq(contentTemplateTable.id, row.id));
+    }
+
+    return result;
+  });
 }
 
-/**
- * `next` with the finished render at `path` (a take, or one of its parts) kept in that item's
- * `renders` unless it's there already, so a write over it never loses a paid render.
- */
-const keepRender = (next: SQL, path: string) => {
-  const stored = contentTemplateTable.structure;
-  const renders = `{${path},renders}`;
-  const kept = sql`coalesce(${stored} #> ${renders}::text[], '[]'::jsonb)`;
-  const current = sql`(${stored} #> ${`{${path},generation}`}::text[])`;
-  // A null value (nothing to keep) leaves `next` as it is.
-  return sql`jsonb_set_lax(${next}, ${renders}::text[], case when ${current} ->> 'status' = 'done' and not ${kept} @> jsonb_build_array(jsonb_build_object('videoUrl', ${current} -> 'videoUrl')) then ${kept} || jsonb_build_array(${current}) end, true, 'return_target')`;
-};
-
-/** Writes a take's or part's render in one statement, keeping the one it replaces. */
-async function setGeneration(
-  templateId: string,
-  path: string,
-  generation: VideoCloneGeneration,
-): Promise<void> {
-  await db
-    .update(contentTemplateTable)
-    .set({
-      structure: sql`jsonb_set(${keepRender(sql`${contentTemplateTable.structure}`, path)}, ${`{${path},generation}`}::text[], ${JSON.stringify(generation)}::jsonb)`,
-    })
-    .where(eq(contentTemplateTable.id, templateId));
-}
-
-/**
- * `next` with the part at `path` playing its own render (`generation`), else its piece of an
- * earlier take render (`takeRender`), else its piece of the take's render; the render it played
- * alone is kept (keepRender).
- */
-const setPartSource = (
-  next: SQL,
-  path: string,
-  source: { generation?: VideoCloneGeneration; takeRender?: string },
-) => {
-  const kept = keepRender(next, path);
-  const own = source.generation
-    ? sql`jsonb_set(${kept}, ${`{${path},generation}`}::text[], ${JSON.stringify(source.generation)}::jsonb)`
-    : sql`${kept} #- ${`{${path},generation}`}::text[]`;
-  return source.takeRender
-    ? sql`jsonb_set(${own}, ${`{${path},takeRender}`}::text[], ${JSON.stringify(source.takeRender)}::jsonb)`
-    : sql`${own} #- ${`{${path},takeRender}`}::text[]`;
-};
-
-export const setVideoCloneGeneration = (
-  templateId: string,
-  takePosition: number,
-  generation: VideoCloneGeneration,
-) => setGeneration(templateId, `video,takes,${takePosition}`, generation);
-
-export const setVideoCloneTakeAnalysis = (
-  templateId: string,
-  takePosition: number,
-  analysis: VideoCloneTakeAnalysis,
-) => setTakeField(templateId, takePosition, "analysis", analysis);
-
-/** One part's own render; it replaces that part's piece of the take's render in the edit. */
-export const setVideoClonePartGeneration = (
-  templateId: string,
-  takePosition: number,
-  partPosition: number,
-  generation: VideoCloneGeneration,
-) =>
-  setGeneration(
-    templateId,
-    `video,takes,${takePosition},parts,${partPosition}`,
-    generation,
-  );
-
-/**
- * Puts every part of a take back on the take's render (their own renders are kept to pick back):
- * they matched, or were picked over, the take render a new one replaces.
- */
-export async function clearVideoClonePartGenerations(
-  templateId: string,
-  takePosition: number,
-  partCount: number,
-): Promise<void> {
-  let structure = sql`${contentTemplateTable.structure}`;
-  for (let k = 0; k < partCount; k++) {
-    structure = setPartSource(
-      structure,
-      `video,takes,${takePosition},parts,${k}`,
-      {},
-    );
+function preservePaidRender(
+  current: VideoCloneGeneration | undefined,
+  existingHistory: VideoCloneGeneration[] | undefined,
+): VideoCloneGeneration[] | undefined {
+  const list = [...(existingHistory ?? [])];
+  if (
+    current?.status === "done" &&
+    current.videoUrl &&
+    !list.some((item) => item.videoUrl === current.videoUrl)
+  ) {
+    list.push(current);
   }
-  await db
-    .update(contentTemplateTable)
-    .set({ structure })
-    .where(eq(contentTemplateTable.id, templateId));
+  return list.length > 0 ? list : undefined;
 }
 
-/** A take's new part timing (an extended or shortened take) and its length. */
-export async function setVideoCloneTakeTiming(
+function sanitizeGeneration(
+  generation: VideoCloneGeneration,
+): VideoCloneGeneration {
+  return generation.error
+    ? { ...generation, error: getErrorMessage(generation.error) }
+    : generation;
+}
+
+/** Updates one take's generation by stable `takeIndex` under row lock, preserving prior paid renders. */
+export async function setVideoCloneGenerationByIndex(
   templateId: string,
-  takePosition: number,
-  parts: VideoClonePart[],
-): Promise<void> {
-  await setTakeField(templateId, takePosition, "parts", parts);
-  await setTakeField(
-    templateId,
-    takePosition,
-    "seconds",
-    parts.at(-1)?.takeEnd ?? 0,
-  );
+  takeIndex: number,
+  generation: VideoCloneGeneration,
+): Promise<boolean> {
+  const safeGeneration = sanitizeGeneration(generation);
+  const updated = await withLockedCloneTemplate(templateId, async (video) => {
+    const take = video.takes.find((item) => item.index === takeIndex);
+    if (!take) return { result: false };
+    take.renders = preservePaidRender(take.generation, take.renders);
+    take.generation = safeGeneration;
+    return { result: true, nextVideo: video };
+  });
+  return updated ?? false;
 }
 
-/** Writes the plan's stitched edit alone, so it never races the takes' own fields. */
-export async function setVideoCloneEdit(
+/** Updates one shot's own generation by stable `(takeIndex, shot)` under row lock. */
+export async function setVideoClonePartGenerationByShot(
   templateId: string,
-  edit: NonNullable<VideoClone["edit"]>,
-): Promise<void> {
-  await db
-    .update(contentTemplateTable)
-    .set({
-      structure: sql`jsonb_set(${contentTemplateTable.structure}, '{video,edit}', ${JSON.stringify(edit)}::jsonb)`,
-    })
-    .where(eq(contentTemplateTable.id, templateId));
+  takeIndex: number,
+  shot: number,
+  generation: VideoCloneGeneration,
+): Promise<boolean> {
+  const safeGeneration = sanitizeGeneration(generation);
+  const updated = await withLockedCloneTemplate(templateId, async (video) => {
+    const take = video.takes.find((item) => item.index === takeIndex);
+    const part = take?.parts.find((item) => item.shot === shot);
+    if (!part) return { result: false };
+    part.renders = preservePaidRender(part.generation, part.renders);
+    part.generation = safeGeneration;
+    return { result: true, nextVideo: video };
+  });
+  return updated ?? false;
 }
 
-/** Turns the burned-in on-screen text on or off for Download. False when the plan isn't the organization's. */
+/** Restores every part of a take to play the take's render while preserving prior part renders. */
+export async function clearVideoClonePartGenerationsByIndex(
+  templateId: string,
+  takeIndex: number,
+): Promise<void> {
+  await withLockedCloneTemplate(templateId, async (video) => {
+    const take = video.takes.find((item) => item.index === takeIndex);
+    if (!take) return { result: undefined };
+    for (const part of take.parts) {
+      part.renders = preservePaidRender(part.generation, part.renders);
+      delete part.generation;
+      delete part.takeRender;
+    }
+    return { result: undefined, nextVideo: video };
+  });
+}
+
 export async function setVideoCloneBurnText(
   organizationId: string,
   templateId: string,
   burnText: boolean,
 ): Promise<boolean> {
-  const updated = await db
-    .update(contentTemplateTable)
-    .set({
-      structure: sql`jsonb_set(${contentTemplateTable.structure}, '{video,burnText}', ${JSON.stringify(burnText)}::jsonb)`,
-    })
-    .where(
-      and(
-        eq(contentTemplateTable.id, templateId),
-        eq(contentTemplateTable.organizationId, organizationId),
-      ),
-    )
-    .returning({ id: contentTemplateTable.id });
-  return updated.length > 0;
+  const updated = await withLockedCloneTemplate(
+    templateId,
+    async (video) => {
+      video.burnText = burnText;
+      return { result: true, nextVideo: video };
+    },
+    organizationId,
+  );
+  return updated ?? false;
 }
 
-/** Adds renders' cuts and lengths (by file) to the plan's, alone, so the page previews what the stitch cut. */
-export async function addVideoCloneRenderCuts(
-  templateId: string,
-  renderCuts: NonNullable<VideoClone["renderCuts"]>,
-): Promise<void> {
-  await db
-    .update(contentTemplateTable)
-    .set({
-      structure: sql`jsonb_set(${contentTemplateTable.structure}, '{video,renderCuts}', coalesce(${contentTemplateTable.structure} #> '{video,renderCuts}', '{}'::jsonb) || ${JSON.stringify(renderCuts)}::jsonb)`,
-    })
-    .where(eq(contentTemplateTable.id, templateId));
-}
-
-/** Writes the plan's background rewrite status alone. */
 export async function setVideoCloneRewrite(
   templateId: string,
   rewrite: NonNullable<VideoClone["rewrite"]>,
 ): Promise<void> {
-  await db
-    .update(contentTemplateTable)
-    .set({
-      structure: sql`jsonb_set(${contentTemplateTable.structure}, '{video,rewrite}', ${JSON.stringify(rewrite)}::jsonb)`,
-    })
-    .where(eq(contentTemplateTable.id, templateId));
+  const safeRewrite = rewrite.error
+    ? { ...rewrite, error: getErrorMessage(rewrite.error) }
+    : rewrite;
+  await withLockedCloneTemplate(templateId, async (video) => {
+    video.rewrite = safeRewrite;
+    return { result: undefined, nextVideo: video };
+  });
+}
+
+/**
+ * Applies all rewritten takes, retimed parts, and added/removed takes in ONE atomic locked
+ * transaction so parallel renders can never drift or lose changes.
+ */
+export async function applyAtomicRewritePlan(
+  templateId: string,
+  input: {
+    takes: {
+      index: number;
+      prompt: string;
+      dialogue: VideoCloneTakeAnalysis["dialogue"] | null;
+      parts: VideoClonePart[] | null;
+    }[];
+    addition: {
+      takes: VideoClone["takes"];
+      story: number[];
+      continuity?: VideoClone["continuity"];
+      removed: number[];
+    } | null;
+  },
+): Promise<void> {
+  await withLockedCloneTemplate(templateId, async (video) => {
+    if (input.addition?.removed.length) {
+      const activeRendering = video.takes.some((take) =>
+        [take.generation, ...take.parts.map((part) => part.generation)].some(
+          (generation) => generation?.status === "generating",
+        ),
+      );
+      if (activeRendering) {
+        throw new Error(
+          "This change merges takes; wait for the renders to finish, then submit it again.",
+        );
+      }
+    }
+
+    for (const patch of input.takes) {
+      const existing = video.takes.find((item) => item.index === patch.index);
+      if (!existing) continue;
+      existing.analysis = {
+        ...existing.analysis,
+        prompt: patch.prompt,
+        dialogue: patch.dialogue ?? existing.analysis.dialogue,
+      };
+      if (patch.parts) {
+        existing.parts = patch.parts;
+        existing.seconds = patch.parts.at(-1)?.takeEnd ?? existing.seconds;
+      }
+    }
+
+    if (input.addition) {
+      const removedSet = new Set(input.addition.removed);
+      for (const addedTake of input.addition.takes) {
+        const idx = video.takes.findIndex(
+          (item) => item.index === addedTake.index,
+        );
+        if (idx >= 0) {
+          const prev = video.takes[idx];
+          video.takes[idx] = {
+            ...addedTake,
+            model: prev?.model,
+            products: prev?.products,
+          };
+        } else {
+          video.takes.push(addedTake);
+        }
+      }
+      if (removedSet.size > 0) {
+        video.takes = video.takes.filter((item) => !removedSet.has(item.index));
+      }
+      video.story = input.addition.story;
+      if (input.addition.continuity) {
+        video.continuity = input.addition.continuity;
+      }
+    }
+
+    return { result: undefined, nextVideo: video };
+  });
+}
+
+/**
+ * Marks `edit.status = "stitching"` with an incremented monotonic `revision`, and ensures at most
+ * one running and one coalesced queued `stitch-video-clone` job exist per template.
+ */
+export async function requestVideoCloneStitch(
+  organizationId: string,
+  templateId: string,
+): Promise<number> {
+  const revision = await withLockedCloneTemplate(
+    templateId,
+    async (video) => {
+      const nextRevision = (video.edit?.revision ?? 0) + 1;
+      video.edit = {
+        videoUrl: video.edit?.videoUrl,
+        textVideoUrl: video.edit?.textVideoUrl,
+        rendered: video.edit?.rendered ?? [],
+        parts: video.edit?.parts,
+        startedAt: new Date().toISOString(),
+        status: "stitching",
+        revision: nextRevision,
+      };
+      return { result: nextRevision, nextVideo: video };
+    },
+    organizationId,
+  );
+  if (revision === null) return 0;
+
+  const jobIdToStart = await db.transaction(async (tx) => {
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtext(${templateId}))`,
+    );
+    const activeStitches = await tx
+      .select({
+        id: backgroundJobTable.id,
+        status: backgroundJobTable.status,
+      })
+      .from(backgroundJobTable)
+      .where(
+        and(
+          eq(backgroundJobTable.taskId, triggerTaskIds.stitchVideoClone),
+          eq(backgroundJobTable.templateId, templateId),
+          inArray(backgroundJobTable.status, ["running", "queued"]),
+        ),
+      );
+
+    const hasRunning = activeStitches.some((job) => job.status === "running");
+    const hasQueued = activeStitches.some((job) => job.status === "queued");
+    if (!hasRunning) {
+      const [inserted] = await tx
+        .insert(backgroundJobTable)
+        .values({
+          taskId: triggerTaskIds.stitchVideoClone,
+          organizationId,
+          templateId,
+          status: "running",
+          payload: { organizationId, templateId },
+          metadata: {},
+          workerId: getWorkerId(),
+          heartbeatAt: new Date(),
+          startedAt: new Date(),
+        })
+        .returning({ id: backgroundJobTable.id });
+      return inserted?.id ?? null;
+    }
+    if (!hasQueued) {
+      await tx.insert(backgroundJobTable).values({
+        taskId: triggerTaskIds.stitchVideoClone,
+        organizationId,
+        templateId,
+        status: "queued",
+        payload: { organizationId, templateId },
+        metadata: {},
+        workerId: null,
+        heartbeatAt: new Date(),
+        startedAt: new Date(),
+      });
+    }
+    return null;
+  });
+
+  if (jobIdToStart) {
+    const { stitchVideoCloneTask } = await import(
+      "@/trigger/stitch-video-clone"
+    );
+    void resumeRunInProcess(jobIdToStart, stitchVideoCloneTask, {
+      organizationId,
+      templateId,
+    });
+  }
+
+  return revision;
+}
+
+/** Backwards-compatible wrapper used by rewrite/pick/remove callers. */
+export async function startVideoCloneStitch(
+  organizationId: string,
+  templateId: string,
+  _previous?: VideoClone["edit"],
+): Promise<void> {
+  await requestVideoCloneStitch(organizationId, templateId);
+}
+
+/**
+ * Commits a finished or failed stitch ONLY if `edit.revision` still matches `targetRevision`,
+ * preventing an older stitch finishing late from overwriting a newer edit.
+ */
+export async function commitVideoCloneEdit(
+  templateId: string,
+  targetRevision: number,
+  editPatch: NonNullable<VideoClone["edit"]>,
+  renderCuts?: Record<string, RenderCuts>,
+): Promise<{ committed: boolean; currentRevision: number }> {
+  const safePatch = editPatch.error
+    ? { ...editPatch, error: getErrorMessage(editPatch.error) }
+    : editPatch;
+  const result = await withLockedCloneTemplate(templateId, async (video) => {
+    if (renderCuts && Object.keys(renderCuts).length > 0) {
+      video.renderCuts = { ...(video.renderCuts ?? {}), ...renderCuts };
+    }
+    const currentRevision = video.edit?.revision ?? 0;
+    if (currentRevision !== targetRevision) {
+      return {
+        result: { committed: false, currentRevision },
+        nextVideo: renderCuts ? video : undefined,
+      };
+    }
+    video.edit = {
+      ...safePatch,
+      revision: targetRevision,
+    };
+    return {
+      result: { committed: true, currentRevision },
+      nextVideo: video,
+    };
+  });
+  return result ?? { committed: false, currentRevision: 0 };
+}
+
+/** Atomically claims the next queued `stitch-video-clone` job for a template, if any. */
+export async function claimNextQueuedStitchJob(templateId: string) {
+  return db.transaction(async (tx) => {
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtext(${templateId}))`,
+    );
+    const candidates = await tx
+      .select()
+      .from(backgroundJobTable)
+      .where(
+        and(
+          eq(backgroundJobTable.taskId, triggerTaskIds.stitchVideoClone),
+          eq(backgroundJobTable.templateId, templateId),
+          eq(backgroundJobTable.status, "queued"),
+        ),
+      )
+      .orderBy(asc(backgroundJobTable.createdAt))
+      .limit(1)
+      .for("update", { skipLocked: true });
+
+    const next = candidates[0];
+    if (!next) return null;
+
+    const [claimed] = await tx
+      .update(backgroundJobTable)
+      .set({
+        status: "running",
+        workerId: getWorkerId(),
+        heartbeatAt: new Date(),
+        startedAt: new Date(),
+      })
+      .where(eq(backgroundJobTable.id, next.id))
+      .returning();
+
+    return claimed ?? null;
+  });
 }
 
 // A rewrite still "rewriting" after this died without saying so; another may start.
 const REWRITE_STALE_MS = 15 * 60 * 1000;
 
-/** Marks the plan rewriting, then applies the toolbar's change in the background (it can take minutes). */
 export async function startVideoCloneRewrite(
   input: Omit<z.infer<typeof rewriteVideoCloneInputSchema>, "startedAt">,
+  options: { skipPreflight?: boolean } = {},
 ): Promise<{ startedAt: string } | { error: string }> {
+  if (!options.skipPreflight) {
+    const preflight = await runPreflight({ scope: "rewrite" });
+    if (!preflight.ok) {
+      return {
+        error:
+          preflight.checks.find((c) => !c.ok)?.details ??
+          "Preflight check failed.",
+      };
+    }
+  }
   const plan = await findVideoClone(input.organizationId, input.templateId);
   if (!plan) return { error: "Clone plan not found." };
   const running = plan.video.rewrite;
@@ -260,37 +505,9 @@ export async function startVideoCloneRewrite(
     await setVideoCloneRewrite(plan.id, {
       ...rewrite,
       status: "failed",
-      error: "Couldn't start applying the change.",
+      error: getErrorMessage(error) || "Couldn't start applying the change.",
     });
     throw error;
-  }
-}
-
-/** Re-stitches the edit from the plan's current renders; the last edit stays watchable meanwhile. */
-export async function startVideoCloneStitch(
-  organizationId: string,
-  templateId: string,
-  previous: VideoClone["edit"],
-): Promise<void> {
-  const edit = {
-    videoUrl: previous?.videoUrl,
-    textVideoUrl: previous?.textVideoUrl,
-    rendered: previous?.rendered ?? [],
-    parts: previous?.parts,
-    startedAt: new Date().toISOString(),
-  };
-  await setVideoCloneEdit(templateId, { ...edit, status: "stitching" });
-  try {
-    await tasks.trigger<typeof stitchVideoCloneTask>(
-      triggerTaskIds.stitchVideoClone,
-      { organizationId, templateId },
-    );
-  } catch (error) {
-    await setVideoCloneEdit(templateId, {
-      ...edit,
-      status: "failed",
-      error: getErrorMessage(error) || "Couldn't start stitching.",
-    });
   }
 }
 
@@ -307,59 +524,78 @@ export async function updateVideoCloneTake(
     keepOriginal?: boolean;
   },
 ) {
-  const plan = await findVideoClone(organizationId, input.templateId);
-  if (!plan) return { error: "Clone plan not found." };
-  const position = plan.video.takes.findIndex(
-    (take) => take.index === input.takeIndex,
-  );
-  const previous = plan.video.takes[position];
-  if (!previous) return { error: "Unknown take." };
-  if (input.keepOriginal && !previous.videoUrl) {
-    return {
-      error: `Take ${previous.index} was added by your changes; it has no original footage to keep.`,
-    };
-  }
-  const take = { ...previous };
+  let canonicalModel: string | undefined;
   if (input.model) {
-    take.model = input.model;
-    await setTakeField(plan.id, position, "model", input.model);
+    try {
+      const { provider } = resolveActiveVideoProvider();
+      canonicalModel = resolveModelForProvider(provider, input.model).id;
+    } catch (error) {
+      return { error: getErrorMessage(error) };
+    }
   }
-  if (input.keepOriginal !== undefined) {
-    take.keepOriginal = input.keepOriginal;
-    await setTakeField(plan.id, position, "keepOriginal", input.keepOriginal);
-  }
+
+  let validatedProducts: string[] | undefined;
   if (input.products) {
-    const products = [...new Set(input.products)];
-    const images = await findAssetImages(organizationId, products);
-    if (images.length !== products.length) {
+    validatedProducts = [...new Set(input.products)];
+    const images = await findAssetImages(organizationId, validatedProducts);
+    if (images.length !== validatedProducts.length) {
       return { error: "Products must be images from Assets." };
     }
-    take.products = products;
-    await setTakeField(plan.id, position, "products", products);
   }
-  if (input.prompt !== undefined || input.dialogue !== undefined) {
-    take.analysis = {
-      ...previous.analysis,
-      prompt: input.prompt ?? previous.analysis.prompt,
-      dialogue: input.dialogue ?? previous.analysis.dialogue,
-    };
-    await setVideoCloneTakeAnalysis(plan.id, position, take.analysis);
+
+  type UpdateTakeOutcome =
+    | { error: string }
+    | {
+        take: VideoClone["takes"][number];
+        previous: VideoClone["takes"][number];
+        needsStitch: boolean;
+      };
+
+  const outcome = await withLockedCloneTemplate<UpdateTakeOutcome>(
+    input.templateId,
+    async (video) => {
+      const take = video.takes.find((item) => item.index === input.takeIndex);
+      if (!take) return { result: { error: "Unknown take." as const } };
+      if (input.keepOriginal && !take.videoUrl) {
+        return {
+          result: {
+            error: `Take ${take.index} was added by your changes; it has no original footage to keep.`,
+          },
+        };
+      }
+      const previous = structuredClone(take);
+      if (canonicalModel) take.model = canonicalModel;
+      if (input.keepOriginal !== undefined) {
+        take.keepOriginal = input.keepOriginal;
+      }
+      if (validatedProducts) take.products = validatedProducts;
+      if (input.prompt !== undefined || input.dialogue !== undefined) {
+        take.analysis = {
+          ...take.analysis,
+          prompt: input.prompt ?? take.analysis.prompt,
+          dialogue: input.dialogue ?? take.analysis.dialogue,
+        };
+      }
+      const needsStitch =
+        keepsOriginal(take) !== keepsOriginal(previous) &&
+        previous.generation?.status === "done";
+      return {
+        result: { take: structuredClone(take), previous, needsStitch },
+        nextVideo: video,
+      };
+    },
+    organizationId,
+  );
+
+  if (!outcome) return { error: "Clone plan not found." };
+  if ("error" in outcome) return outcome;
+  if (outcome.needsStitch) {
+    await requestVideoCloneStitch(organizationId, input.templateId);
   }
-  // A rendered take switching between its render and the original changes the edit's footage.
-  if (
-    keepsOriginal(take) !== keepsOriginal(previous) &&
-    previous.generation?.status === "done"
-  ) {
-    await startVideoCloneStitch(organizationId, plan.id, plan.video.edit);
-  }
-  return { take, previous };
+  return { take: outcome.take, previous: outcome.previous };
 }
 
-/**
- * Puts a finished render back in the edit and re-stitches: one of a take's renders for the whole
- * take (its shots' picks go), or, for one shot (`shot`), its piece of any of the take's renders or
- * one of its own renders. Not while the take renders: its result would land over the pick.
- */
+/** Puts a finished render back in the edit and re-stitches, inside a locked row transaction. */
 export async function pickVideoCloneRender(
   organizationId: string,
   input: {
@@ -369,166 +605,165 @@ export async function pickVideoCloneRender(
     videoUrl: string;
   },
 ) {
-  const plan = await findVideoClone(organizationId, input.templateId);
-  if (!plan) return { error: "Clone plan not found." };
-  const position = plan.video.takes.findIndex(
-    (take) => take.index === input.takeIndex,
+  type PickRenderOutcome =
+    | { error: string }
+    | { picked: boolean; needsStitch: boolean };
+
+  const outcome = await withLockedCloneTemplate<PickRenderOutcome>(
+    input.templateId,
+    async (video) => {
+      const take = video.takes.find((item) => item.index === input.takeIndex);
+      if (!take) return { result: { error: "Unknown take." as const } };
+
+      if (
+        [take.generation, ...take.parts.map((part) => part.generation)].some(
+          (generation) => generation?.status === "generating",
+        )
+      ) {
+        return {
+          result: {
+            error: `Take ${take.index} is rendering; pick a version once it's done.`,
+          },
+        };
+      }
+
+      const current =
+        take.generation?.status === "done"
+          ? take.generation.videoUrl
+          : undefined;
+      const fromTake = videoCloneRenders(take).find(
+        (render) => render.videoUrl === input.videoUrl,
+      );
+
+      if (input.shot === undefined) {
+        if (!fromTake) return { result: { error: "Unknown render." as const } };
+        const picks = take.parts.some(
+          (part) => part.takeRender || part.generation?.status === "done",
+        );
+        if (fromTake.videoUrl === current && !picks) {
+          return { result: { picked: false, needsStitch: false } };
+        }
+        take.renders = preservePaidRender(take.generation, take.renders);
+        take.generation = fromTake;
+        for (const part of take.parts) {
+          part.renders = preservePaidRender(part.generation, part.renders);
+          delete part.generation;
+          delete part.takeRender;
+        }
+      } else {
+        const part = take.parts.find((item) => item.shot === input.shot);
+        if (!part) return { result: { error: "Unknown shot." as const } };
+        const own = videoCloneRenders(part).find(
+          (render) => render.videoUrl === input.videoUrl,
+        );
+        if (!own && !fromTake) {
+          return { result: { error: "Unknown render." as const } };
+        }
+        const playing =
+          part.generation?.status === "done"
+            ? part.generation.videoUrl
+            : (part.takeRender ?? current);
+        if (playing === input.videoUrl) {
+          return { result: { picked: false, needsStitch: false } };
+        }
+        part.renders = preservePaidRender(part.generation, part.renders);
+        if (own) {
+          part.generation = own;
+          delete part.takeRender;
+        } else {
+          delete part.generation;
+          if (input.videoUrl === current) {
+            delete part.takeRender;
+          } else {
+            part.takeRender = input.videoUrl;
+          }
+        }
+      }
+
+      return {
+        result: { picked: true, needsStitch: !keepsOriginal(take) },
+        nextVideo: video,
+      };
+    },
+    organizationId,
   );
-  const take = plan.video.takes[position];
-  if (!take) return { error: "Unknown take." };
-  if (
-    [take.generation, ...take.parts.map((part) => part.generation)].some(
-      (generation) => generation?.status === "generating",
-    )
-  ) {
-    return {
-      error: `Take ${take.index} is rendering; pick a version once it's done.`,
-    };
+
+  if (!outcome) return { error: "Clone plan not found." };
+  if ("error" in outcome) return outcome;
+  if (outcome.needsStitch) {
+    await requestVideoCloneStitch(organizationId, input.templateId);
   }
-  const current =
-    take.generation?.status === "done" ? take.generation.videoUrl : undefined;
-  const fromTake = videoCloneRenders(take).find(
-    (render) => render.videoUrl === input.videoUrl,
-  );
-  if (input.shot === undefined) {
-    if (!fromTake) return { error: "Unknown render." };
-    const picks = take.parts.some(
-      (part) => part.takeRender || part.generation?.status === "done",
-    );
-    if (fromTake.videoUrl === current && !picks) return { picked: false };
-    await setVideoCloneGeneration(plan.id, position, fromTake);
-    await clearVideoClonePartGenerations(plan.id, position, take.parts.length);
-  } else {
-    const k = take.parts.findIndex((part) => part.shot === input.shot);
-    const part = take.parts[k];
-    if (!part) return { error: "Unknown shot." };
-    const own = videoCloneRenders(part).find(
-      (render) => render.videoUrl === input.videoUrl,
-    );
-    if (!own && !fromTake) return { error: "Unknown render." };
-    const playing =
-      part.generation?.status === "done"
-        ? part.generation.videoUrl
-        : (part.takeRender ?? current);
-    if (playing === input.videoUrl) return { picked: false };
-    await db
-      .update(contentTemplateTable)
-      .set({
-        structure: setPartSource(
-          sql`${contentTemplateTable.structure}`,
-          `video,takes,${position},parts,${k}`,
-          // The take's current render needs no pick: the part plays it anyway.
-          own
-            ? { generation: own }
-            : {
-                takeRender:
-                  input.videoUrl === current ? undefined : input.videoUrl,
-              },
-        ),
-      })
-      .where(eq(contentTemplateTable.id, plan.id));
-  }
-  if (!keepsOriginal(take)) {
-    await startVideoCloneStitch(organizationId, plan.id, plan.video.edit);
-  }
-  return { picked: true };
+  return { picked: outcome.picked };
 }
 
 /**
- * Adds the takes a change wrote (addVideoCloneTakes), with the story and continuity they join.
- * A take written again replaces the one with its index in place (renders write their take by
- * position), keeping its model and pinned products; its render goes with it. Takes merged away
- * (`removed`) go last, by index; not while anything renders.
- */
-export async function addVideoCloneTakesToPlan(
-  templateId: string,
-  /** The plan's takes when the change started: positions hold, takes are only appended meanwhile. */
-  current: VideoClone["takes"],
-  addition: {
-    takes: VideoClone["takes"];
-    story: number[];
-    continuity?: VideoClone["continuity"];
-    removed: number[];
-  },
-): Promise<void> {
-  const structure = sql`${contentTemplateTable.structure}`;
-  const positions = new Map(
-    current.map((take, position) => [take.index, position]),
-  );
-  const fresh = addition.takes.filter((take) => !positions.has(take.index));
-  // Appended in place, so renders landing meanwhile keep their writes.
-  let next = sql`jsonb_set(${structure}, '{video,takes}', (${structure} #> '{video,takes}') || ${JSON.stringify(fresh)}::jsonb)`;
-  for (const take of addition.takes) {
-    const position = positions.get(take.index);
-    if (position === undefined) continue;
-    const { model, products } = current[position] ?? {};
-    next = sql`jsonb_set(${next}, ${`{video,takes,${position}}`}::text[], ${JSON.stringify({ model, products, ...take })}::jsonb)`;
-  }
-  if (addition.removed.length > 0) {
-    next = sql`jsonb_set(${next}, '{video,takes}', coalesce((select jsonb_agg(take order by position) from jsonb_array_elements(${next} #> '{video,takes}') with ordinality as t(take, position) where not ${JSON.stringify(addition.removed)}::jsonb @> (take -> 'index')), '[]'::jsonb))`;
-  }
-  next = sql`jsonb_set(${next}, '{video,story}', ${JSON.stringify(addition.story)}::jsonb)`;
-  if (addition.continuity) {
-    next = sql`jsonb_set(${next}, '{video,continuity}', ${JSON.stringify(addition.continuity)}::jsonb)`;
-  }
-  await db
-    .update(contentTemplateTable)
-    .set({ structure: next })
-    .where(eq(contentTemplateTable.id, templateId));
-}
-
-/**
- * Removes a take that changes added, and its shots from the story and continuity. Not while
- * anything renders: renders write their take by position.
+ * Removes a take that changes added, and its shots from the story and continuity.
  */
 export async function removeVideoCloneTake(
   organizationId: string,
   templateId: string,
   takeIndex: number,
 ) {
-  const plan = await findVideoClone(organizationId, templateId);
-  if (!plan) return { error: "Clone plan not found." };
-  const take = plan.video.takes.find((item) => item.index === takeIndex);
-  if (!take) return { error: "Unknown take." };
-  if (take.videoUrl) {
-    return { error: "Only takes your changes added can be removed." };
+  type RemoveTakeOutcome =
+    | { error: string }
+    | { removed: number; needsStitch: boolean };
+
+  const outcome = await withLockedCloneTemplate<RemoveTakeOutcome>(
+    templateId,
+    async (video) => {
+      const take = video.takes.find((item) => item.index === takeIndex);
+      if (!take) return { result: { error: "Unknown take." as const } };
+      if (take.videoUrl) {
+        return {
+          result: {
+            error: "Only takes your changes added can be removed." as const,
+          },
+        };
+      }
+      if (
+        video.rewrite?.status === "rewriting" ||
+        video.takes.some((item) =>
+          [item.generation, ...item.parts.map((part) => part.generation)].some(
+            (generation) => generation?.status === "generating",
+          ),
+        )
+      ) {
+        return {
+          result: {
+            error:
+              "Wait for the renders and changes to finish, then remove it." as const,
+          },
+        };
+      }
+
+      const shots = new Set(take.parts.map((part) => part.shot));
+      video.takes = video.takes.filter((item) => item.index !== takeIndex);
+      if (video.story) {
+        video.story = video.story.filter((shot) => !shots.has(shot));
+      }
+      if (video.continuity) {
+        video.continuity = video.continuity.map((element) => ({
+          ...element,
+          shots: element.shots.filter((shot) => !shots.has(shot)),
+        }));
+      }
+      const needsStitch = Boolean(video.edit?.rendered.includes(takeIndex));
+      return {
+        result: { removed: takeIndex, needsStitch },
+        nextVideo: video,
+      };
+    },
+    organizationId,
+  );
+
+  if (!outcome) return { error: "Clone plan not found." };
+  if ("error" in outcome) return outcome;
+  if (outcome.needsStitch) {
+    await requestVideoCloneStitch(organizationId, templateId);
   }
-  if (
-    plan.video.rewrite?.status === "rewriting" ||
-    plan.video.takes.some((item) =>
-      [item.generation, ...item.parts.map((part) => part.generation)].some(
-        (generation) => generation?.status === "generating",
-      ),
-    )
-  ) {
-    return {
-      error: "Wait for the renders and changes to finish, then remove it.",
-    };
-  }
-  const shots = new Set(take.parts.map((part) => part.shot));
-  const structure = sql`${contentTemplateTable.structure}`;
-  let next = sql`jsonb_set(${structure}, '{video,takes}', ${JSON.stringify(plan.video.takes.filter((item) => item !== take))}::jsonb)`;
-  if (plan.video.story) {
-    next = sql`jsonb_set(${next}, '{video,story}', ${JSON.stringify(plan.video.story.filter((shot) => !shots.has(shot)))}::jsonb)`;
-  }
-  if (plan.video.continuity) {
-    const continuity = plan.video.continuity.map((element) => ({
-      ...element,
-      shots: element.shots.filter((shot) => !shots.has(shot)),
-    }));
-    next = sql`jsonb_set(${next}, '{video,continuity}', ${JSON.stringify(continuity)}::jsonb)`;
-  }
-  await db
-    .update(contentTemplateTable)
-    .set({ structure: next })
-    .where(eq(contentTemplateTable.id, plan.id));
-  if (plan.video.edit?.rendered.includes(takeIndex)) {
-    await startVideoCloneStitch(organizationId, plan.id, plan.video.edit);
-  }
-  return { removed: takeIndex };
+  return { removed: outcome.removed };
 }
 
-/** Deletes the organization's clone plan; its stored clips stay, like a deleted post's images. */
 export async function deleteVideoClone(
   organizationId: string,
   templateId: string,
@@ -547,7 +782,6 @@ export async function deleteVideoClone(
   return deleted.length > 0;
 }
 
-/** The organization's images among `ids`, e.g. a take's pinned products. */
 export const findAssetImages = (organizationId: string, ids: string[]) =>
   ids.length === 0
     ? Promise.resolve([])
@@ -566,7 +800,6 @@ export const findAssetImages = (organizationId: string, ids: string[]) =>
           ),
         );
 
-/** Product photos to pin on takes: the images in Assets folders, by folder. */
 export const listVideoCloneProductOptions = (organizationId: string) =>
   db
     .select({
@@ -591,7 +824,6 @@ export const listVideoCloneProductOptions = (organizationId: string) =>
       asc(creativeAssetTable.createdAt),
     );
 
-/** The organization's clone plan, if the template is one. */
 export async function findVideoClone(
   organizationId: string,
   templateId: string,
@@ -608,13 +840,11 @@ export async function findVideoClone(
     ? {
         id: template.id,
         name: template.name,
-        // A run that died never marks its takes failed; nothing else would let them render again.
         video: settleDeadRenders(video),
       }
     : undefined;
 }
 
-/** Our products for a render: the images in one gallery folder, oldest first. */
 export async function findProductImages(
   organizationId: string,
   folderName: string,
@@ -653,26 +883,32 @@ export async function findProductImages(
   return { images };
 }
 
-/** Marks the takes as rendering, then starts the Seedance run; each take's result lands on the plan. */
+/**
+ * Validates provider, preflight, references, and atomic non-overlapping active-render guards,
+ * marks the selected takes/shot `"generating"`, and launches `generateVideoCloneTask`.
+ */
 export async function startVideoCloneRender(
   input: Omit<z.infer<typeof generateVideoCloneInputSchema>, "startedAt">,
+  options: { skipPreflight?: boolean } = {},
 ): Promise<{ runId: string } | { error: string }> {
-  // Fails fast when the provider's key isn't set.
-  const setupError = await getVideoProvider().then(
-    () => null,
-    (error: unknown) => getErrorMessage(error),
-  );
-  if (setupError) return { error: setupError };
-  const plan = await findVideoClone(input.organizationId, input.templateId);
-  if (!plan) return { error: "Clone plan not found." };
-  const { takes } = plan.video;
-  const characters = new Set(plan.video.vibe.characters.map(({ id }) => id));
-  const unknown = Object.keys(input.cast).find((id) => !characters.has(id));
-  if (unknown) {
-    return {
-      error: `No character "${unknown}" in this clone; its cast is ${[...characters].join(", ") || "empty"}.`,
-    };
+  let provider: ReturnType<typeof resolveActiveVideoProvider>["provider"];
+  try {
+    provider = resolveActiveVideoProvider().provider;
+  } catch (error) {
+    return { error: getErrorMessage(error) };
   }
+
+  if (!options.skipPreflight) {
+    const preflight = await runPreflight({ scope: "render" });
+    if (!preflight.ok) {
+      return {
+        error:
+          preflight.checks.find((c) => !c.ok)?.details ??
+          "Preflight check failed.",
+      };
+    }
+  }
+
   const faceIds = [...new Set(Object.values(input.cast))];
   const faces = await findFaces(input.organizationId, faceIds);
   if (faces.length !== faceIds.length) {
@@ -685,7 +921,7 @@ export async function startVideoCloneRender(
     );
     if ("error" in products) return products;
   }
-  // Picked frames are stills the clip dialog uploaded (uploadImageFile); nothing else gets signed.
+
   const uploads = `/storage/${storageConfig.bucketNames.images}/creative-assets/uploads/`;
   if (
     input.frames.some(
@@ -696,55 +932,154 @@ export async function startVideoCloneRender(
   ) {
     return { error: "Attach frames from the timeline." };
   }
-  const positions = input.takeIndexes.map((index) =>
-    takes.findIndex((take) => take.index === index),
-  );
-  if (positions.includes(-1)) return { error: "Unknown take." };
-  const kept = takes.find(
-    (take) => input.takeIndexes.includes(take.index) && keepsOriginal(take),
-  );
-  if (kept) {
-    return {
-      error: `Take ${kept.index} keeps its original footage; pick a model for it to render it.`,
-    };
-  }
-  // A shot is redone alone to fit back into its take's render.
-  const take = takes[positions[0] ?? -1];
-  const redo = take?.parts.findIndex((part) => part.shot === input.shot);
-  if (input.shot !== undefined) {
-    if (!take || positions.length !== 1 || redo === -1) {
-      return { error: "Pick one shot of one take." };
-    }
-    if (take.parts.length < 2) {
-      return {
-        error: `Take ${take.index} is a single shot; render the take instead.`,
-      };
-    }
-    if (take.generation?.status !== "done") {
-      return {
-        error: `Render take ${take.index} first; a shot is redone to match its render.`,
-      };
-    }
-  }
 
-  // Mark the takes (or the shot) before the run starts so the page shows them rendering right away.
   const startedAt = new Date().toISOString();
-  const mark = (generation: VideoCloneGeneration) =>
-    Promise.all(
-      positions.map((position) =>
-        input.shot !== undefined && redo !== undefined
-          ? setVideoClonePartGeneration(plan.id, position, redo, generation)
-          : setVideoCloneGeneration(plan.id, position, generation),
-      ),
-    );
-  const generation = {
+  const baseGeneration: VideoCloneGeneration = {
     prompt: "",
     cast: input.cast,
     changes: input.changes,
     productFolder: input.productFolder,
     startedAt,
+    status: "generating",
   };
-  await mark({ ...generation, status: "generating" });
+
+  // Atomic check-and-mark inside row lock + active render_attempts check.
+  const lockedCheck = await db.transaction(async (tx) => {
+    const rows = await tx
+      .select({
+        id: contentTemplateTable.id,
+        structure: contentTemplateTable.structure,
+      })
+      .from(contentTemplateTable)
+      .where(
+        and(
+          eq(contentTemplateTable.id, input.templateId),
+          eq(contentTemplateTable.organizationId, input.organizationId),
+        ),
+      )
+      .for("update");
+    const row = rows[0];
+    const video = row?.structure.video;
+    if (!row || !video) {
+      return { error: "Clone plan not found." as const };
+    }
+
+    const characters = new Set(video.vibe.characters.map(({ id }) => id));
+    const unknown = Object.keys(input.cast).find((id) => !characters.has(id));
+    if (unknown) {
+      return {
+        error: `No character "${unknown}" in this clone; its cast is ${[...characters].join(", ") || "empty"}.`,
+      };
+    }
+
+    const selectedTakes = input.takeIndexes.map((idx) =>
+      video.takes.find((take) => take.index === idx),
+    );
+    if (selectedTakes.some((take) => !take)) {
+      return { error: "Unknown take." as const };
+    }
+
+    const validTakes = selectedTakes as VideoClone["takes"];
+    const kept = validTakes.find((take) => keepsOriginal(take));
+    if (kept) {
+      return {
+        error: `Take ${kept.index} keeps its original footage; pick a model for it to render it.`,
+      };
+    }
+
+    for (const take of validTakes) {
+      try {
+        resolveModelForProvider(provider, take.model);
+      } catch (error) {
+        return { error: getErrorMessage(error) };
+      }
+    }
+
+    if (input.shot !== undefined) {
+      const first = validTakes[0];
+      const part = first?.parts.find((item) => item.shot === input.shot);
+      if (!first || validTakes.length !== 1 || !part) {
+        return { error: "Pick one shot of one take." as const };
+      }
+      if (first.parts.length < 2) {
+        return {
+          error: `Take ${first.index} is a single shot; render the take instead.`,
+        };
+      }
+      if (first.generation?.status !== "done") {
+        return {
+          error: `Render take ${first.index} first; a shot is redone to match its render.`,
+        };
+      }
+    }
+
+    const targetShot = input.shot ?? -1;
+    const activeAttempts = await tx
+      .select({ takeIndex: renderAttemptTable.takeIndex })
+      .from(renderAttemptTable)
+      .where(
+        and(
+          eq(renderAttemptTable.templateId, row.id),
+          inArray(renderAttemptTable.takeIndex, input.takeIndexes),
+          inArray(renderAttemptTable.status, [
+            "claiming",
+            "submitting",
+            "submitted",
+            "ambiguous",
+            "downloading",
+          ]),
+          ...(input.shot !== undefined
+            ? [inArray(renderAttemptTable.shot, [-1, targetShot])]
+            : []),
+        ),
+      );
+    if (activeAttempts.length > 0) {
+      return {
+        error: `Take ${activeAttempts[0]?.takeIndex} already has an active render in progress.`,
+      };
+    }
+
+    const nextVideo = structuredClone(video);
+    for (const takeIndex of input.takeIndexes) {
+      const take = nextVideo.takes.find((item) => item.index === takeIndex);
+      if (!take) continue;
+      if (input.shot !== undefined) {
+        const part = take.parts.find((item) => item.shot === input.shot);
+        if (part) {
+          if (part.generation?.status === "generating") {
+            return {
+              error: `Shot ${input.shot} of take ${takeIndex} is already rendering.`,
+            };
+          }
+          part.renders = preservePaidRender(part.generation, part.renders);
+          part.generation = { ...baseGeneration };
+        }
+      } else {
+        if (
+          take.generation?.status === "generating" ||
+          take.parts.some((part) => part.generation?.status === "generating")
+        ) {
+          return {
+            error: `Take ${takeIndex} is already rendering.`,
+          };
+        }
+        take.renders = preservePaidRender(take.generation, take.renders);
+        take.generation = { ...baseGeneration };
+      }
+    }
+
+    await tx
+      .update(contentTemplateTable)
+      .set({ structure: { ...row.structure, video: nextVideo } })
+      .where(eq(contentTemplateTable.id, row.id));
+
+    return { ok: true as const };
+  });
+
+  if ("error" in lockedCheck && lockedCheck.error) {
+    return { error: lockedCheck.error };
+  }
+
   try {
     const handle = await tasks.trigger<typeof generateVideoCloneTask>(
       triggerTaskIds.generateVideoClone,
@@ -752,16 +1087,31 @@ export async function startVideoCloneRender(
     );
     return { runId: handle.id };
   } catch (error) {
-    await mark({
-      ...generation,
+    const failedGeneration: VideoCloneGeneration = {
+      ...baseGeneration,
       status: "failed",
-      error: "Couldn't start the render.",
-    });
+      error: getErrorMessage(error) || "Couldn't start the render.",
+    };
+    await Promise.all(
+      input.takeIndexes.map((takeIndex) =>
+        input.shot !== undefined
+          ? setVideoClonePartGenerationByShot(
+              input.templateId,
+              takeIndex,
+              input.shot,
+              failedGeneration,
+            )
+          : setVideoCloneGenerationByIndex(
+              input.templateId,
+              takeIndex,
+              failedGeneration,
+            ),
+      ),
+    );
     throw error;
   }
 }
 
-/** The workspace's clone plans, newest first. */
 export async function listVideoClones(organizationId: string) {
   const templates = await db.query.contentTemplateTable.findMany({
     where: and(
@@ -790,7 +1140,6 @@ export async function listVideoClones(organizationId: string) {
   });
 }
 
-/** A presigned PUT for a source video upload; startVideoClone only takes keys shaped like these. */
 export async function prepareVideoCloneUpload(
   organizationId: string,
   input: { extension: string; mimeType: string; sizeBytes: number },
@@ -805,13 +1154,23 @@ export async function prepareVideoCloneUpload(
   return { signedUrl, storageKey };
 }
 
-/** Analyzes a link or an uploaded video in the background (analyze-video-clone), which saves the plan. */
-export async function startVideoClone(input: {
-  organizationId: string;
-  /** A link already normalized by videoCloneUrlSchema, or an upload key from prepareVideoCloneUpload. */
-  source: { url: string } | { storageKey: string };
-  name?: string;
-}): Promise<{ id: string }> {
+export async function startVideoClone(
+  input: {
+    organizationId: string;
+    source: { url: string } | { storageKey: string };
+    name?: string;
+  },
+  options: { skipPreflight?: boolean } = {},
+): Promise<{ id: string }> {
+  if (!options.skipPreflight) {
+    const preflight = await runPreflight({ scope: "analyze" });
+    if (!preflight.ok) {
+      throw new Error(
+        preflight.checks.find((c) => !c.ok)?.details ??
+          "Preflight check failed.",
+      );
+    }
+  }
   let sourceUrl: string;
   if ("url" in input.source) {
     sourceUrl = input.source.url;
@@ -840,11 +1199,9 @@ export async function startVideoClone(input: {
   );
 }
 
-// Keys uploadImageFile returns (app/api/storage/upload); nothing else gets saved as a photo.
 const isUploadedImage = (storageKey: string) =>
   /^creative-assets\/uploads\/[0-9a-f-]{36}$/u.test(storageKey);
 
-/** Product photos uploaded together become one product: a new folder named after the first photo. */
 export async function addVideoCloneProduct(
   organizationId: string,
   assets: { name: string; storageKey: string }[],
@@ -886,7 +1243,6 @@ export async function addVideoCloneProduct(
   return { folder: name };
 }
 
-/** Faces that can play a character, oldest first. */
 export const listFaces = (organizationId: string) =>
   db
     .select({
@@ -898,7 +1254,6 @@ export const listFaces = (organizationId: string) =>
     .where(eq(faceTable.organizationId, organizationId))
     .orderBy(asc(faceTable.createdAt));
 
-/** The workspace's faces among `ids`, e.g. a render's cast. */
 export const findFaces = (organizationId: string, ids: string[]) =>
   ids.length === 0
     ? Promise.resolve([])
@@ -912,7 +1267,6 @@ export const findFaces = (organizationId: string, ids: string[]) =>
           ),
         );
 
-/** Saves an uploaded portrait (uploadImageFile) as a face. */
 export async function createFace(
   organizationId: string,
   input: { name: string; storageKey: string },
@@ -932,7 +1286,6 @@ export async function createFace(
   return face;
 }
 
-/** Deletes a face; renders it played keep their videos. False when it isn't the workspace's. */
 export async function deleteFace(
   organizationId: string,
   id: string,
@@ -944,4 +1297,15 @@ export async function deleteFace(
     )
     .returning({ id: faceTable.id });
   return deleted.length > 0;
+}
+
+/** Signs a `/storage/<bucket>/<path>` URL using `S3_PUBLIC_ENDPOINT` for remote video generators. */
+export async function resolvePublicStorageReferenceUrl(
+  url: string,
+  expiresInSeconds: number,
+): Promise<string> {
+  if (!url?.startsWith("/storage/")) return url;
+  const [, bucket, ...parts] = url.split("/").filter(Boolean);
+  if (!bucket || parts.length === 0) return url;
+  return getPublicSignedUrl(parts.join("/"), bucket, expiresInSeconds);
 }

@@ -56,26 +56,22 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { storageConfig } from "@/config/storage.config";
 import {
-  DEFAULT_VIDEO_CLONE_MODEL,
-  DEFAULT_VIDEO_PROVIDER,
+  DEFAULT_VIDEO_MODEL_ID,
+  estimateVideoCloneRenderUsd,
   isAddedPart,
   isInstagramUrl,
   isTikTokUrl,
   keepsOriginal,
   MAX_PICKED_FRAMES,
   MAX_VIDEO_CLONE_PRODUCTS,
-  VIDEO_CLONE_MODEL_IDS,
-  VIDEO_CLONE_MODELS,
+  normalizeVideoModelId,
   type VideoCloneEditClip,
   type VideoCloneModel,
   type VideoCloneVerdict,
-  type VideoProvider,
   videoCloneEditClips,
   videoCloneMismatch,
   videoCloneRenders,
-  videoCloneRenderUsd,
   videoCloneStory,
   videoCloneStoryTime,
 } from "@/lib/content-workflows/video-clone";
@@ -146,6 +142,27 @@ const ENTER =
 const VIEWER =
   "mx-auto aspect-[9/16] h-[clamp(360px,calc(100vh-28rem),720px)] max-w-full rounded-xl bg-black object-contain";
 
+type ProviderInfo = Outputs["videoClone"]["provider"];
+type ProviderModelOption = ProviderInfo["models"][number];
+const FALLBACK_MODELS: ProviderModelOption[] = [
+  {
+    id: DEFAULT_VIDEO_MODEL_ID,
+    label: "Seedance 2.5",
+    aliases: ["bytedance/seedance-2-5"],
+    usdPerSecond: 0.14,
+    maxImages: 30,
+    minSeconds: 4,
+    maxSeconds: 30,
+  },
+];
+const FALLBACK_PROVIDER_INFO: ProviderInfo = {
+  id: "kie",
+  label: "KIE",
+  defaultModelId: DEFAULT_VIDEO_MODEL_ID,
+  requiresPublicCallbackUrl: true,
+  models: FALLBACK_MODELS,
+};
+
 const clock = (value: number) => {
   const whole = Math.floor(value);
   return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
@@ -153,8 +170,15 @@ const clock = (value: number) => {
 const usd = new Intl.NumberFormat("en", { style: "currency", currency: "USD" });
 const renderCost = (
   takes: { seconds: number; model?: VideoCloneModel }[],
-  provider: VideoProvider,
-) => usd.format(videoCloneRenderUsd(takes, provider));
+  providerInfo: ProviderInfo,
+) =>
+  usd.format(
+    estimateVideoCloneRenderUsd(
+      takes,
+      providerInfo.models,
+      providerInfo.defaultModelId,
+    ),
+  );
 
 /** A take, or a shot of it redone alone, is rendering. */
 const isRendering = (take: Take) =>
@@ -212,9 +236,8 @@ export function VideoCloneDetail({ templateId }: { templateId: string }) {
 function CloneEditor({ plan }: { plan: Plan }) {
   const router = useRouter();
   const utils = trpc.useUtils();
-  const provider =
-    trpc.videoClone.provider.useQuery().data?.provider ??
-    DEFAULT_VIDEO_PROVIDER;
+  const providerInfo =
+    trpc.videoClone.provider.useQuery().data ?? FALLBACK_PROVIDER_INFO;
   const faces = trpc.face.list.useQuery().data ?? [];
   const products = trpc.videoClone.products.useQuery().data;
   const folders = [...new Set((products ?? []).map(({ folder }) => folder))];
@@ -843,7 +866,7 @@ function CloneEditor({ plan }: { plan: Plan }) {
           onClose={() => setClip(null)}
           onRender={render}
           plan={plan}
-          provider={provider}
+          providerInfo={providerInfo}
           segments={segments}
         />
       ) : null}
@@ -1229,7 +1252,7 @@ function CloneEditor({ plan }: { plan: Plan }) {
             {generate.isPending ? null : <SparklesIcon />}
             Render {renderable.length}{" "}
             {renderable.length === 1 ? "take" : "takes"} ·{" "}
-            {renderCost(renderable, provider)}
+            {renderCost(renderable, providerInfo)}
           </Button>
         ) : null}
       </div>
@@ -1746,7 +1769,7 @@ function ClipDialog({
   onClose,
   onRender,
   plan,
-  provider,
+  providerInfo,
   segments,
 }: {
   busy: boolean;
@@ -1759,7 +1782,7 @@ function ClipDialog({
     frames: string[],
   ) => void;
   plan: Plan;
-  provider: VideoProvider;
+  providerInfo: ProviderInfo;
   /** The edit as it plays now (videoCloneEditClips). */
   segments: VideoCloneEditClip[];
 }) {
@@ -1814,8 +1837,16 @@ function ClipDialog({
   const takePicked = take.parts.some(
     (item) => item.takeRender || item.generation?.status === "done",
   );
-  const made = (render: { model?: VideoCloneModel; startedAt: string }) =>
-    `${VIDEO_CLONE_MODELS[render.model ?? DEFAULT_VIDEO_CLONE_MODEL].label} · ${new Date(render.startedAt).toLocaleString()}`;
+  const made = (render: { model?: VideoCloneModel; startedAt: string }) => {
+    const normalized = normalizeVideoModelId(
+      render.model ?? providerInfo.defaultModelId,
+    );
+    const label =
+      providerInfo.models.find(
+        (m) => m.id === normalized || m.aliases.includes(render.model ?? ""),
+      )?.label ?? normalized;
+    return `${label} · ${new Date(render.startedAt).toLocaleString()}`;
+  };
   // This clip's versions: its piece of each take render, then each render of it alone.
   const versions =
     kept || !part
@@ -1863,13 +1894,10 @@ function ClipDialog({
       canvas.toBlob(resolve, "image/jpeg", 0.92);
       const blob = await promise;
       if (!blob) throw new Error("Couldn't read the frame.");
-      const { storageKey } = await uploadImageFile(
+      const { url } = await uploadImageFile(
         new File([blob], "frame.jpg", { type: "image/jpeg" }),
       );
-      setFrames((current) => [
-        ...current,
-        `/storage/${storageConfig.bucketNames.images}/${storageKey}`,
-      ]);
+      setFrames((current) => [...current, url]);
     } catch (error) {
       toast.error(getErrorMessage(error) || "Couldn't attach the frame.");
     } finally {
@@ -2146,7 +2174,7 @@ function ClipDialog({
               Redo this shot ·{" "}
               {renderCost(
                 [{ seconds: part.takeEnd - part.takeStart, model: take.model }],
-                provider,
+                providerInfo,
               )}
             </button>
           ) : null}
@@ -2158,7 +2186,7 @@ function ClipDialog({
           >
             <SparklesIcon />
             {RENDER_LABEL[take.generation?.status ?? "new"]} take {take.index} ·{" "}
-            {renderCost([take], provider)}
+            {renderCost([take], providerInfo)}
           </Button>
         </div>
       </DialogContent>
@@ -2267,9 +2295,8 @@ function TakeRow({
   templateId: string;
 }) {
   const utils = trpc.useUtils();
-  const provider =
-    trpc.videoClone.provider.useQuery().data?.provider ??
-    DEFAULT_VIDEO_PROVIDER;
+  const providerInfo =
+    trpc.videoClone.provider.useQuery().data ?? FALLBACK_PROVIDER_INFO;
   const update = trpc.videoClone.updateTake.useMutation({
     onSuccess: () => utils.videoClone.get.invalidate({ id: templateId }),
     onError: (error) => toast.error(error.message),
@@ -2304,7 +2331,9 @@ function TakeRow({
   const takeRender =
     !kept && generation?.status === "done" ? generation.videoUrl : undefined;
   // The menu's one choice: a model, or the original footage.
-  const choice = kept ? "original" : (take.model ?? DEFAULT_VIDEO_CLONE_MODEL);
+  const choice = kept
+    ? "original"
+    : normalizeVideoModelId(take.model ?? providerInfo.defaultModelId);
   const pinned = take.products ?? [];
   const productById = new Map(
     (products ?? []).map((product) => [product.id, product]),
@@ -2420,7 +2449,7 @@ function TakeRow({
                         <SparklesIcon />
                         {RENDER_LABEL[generation?.status ?? "new"]} this take
                         <DropdownMenuShortcut>
-                          {renderCost([take], provider)}
+                          {renderCost([take], providerInfo)}
                         </DropdownMenuShortcut>
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
@@ -2439,14 +2468,14 @@ function TakeRow({
                         });
                         return;
                       }
-                      const model = VIDEO_CLONE_MODEL_IDS.find(
-                        (id) => id === value,
+                      const model = providerInfo.models.find(
+                        (item) => item.id === value,
                       );
                       if (model) {
                         update.mutate({
                           templateId,
                           takeIndex: take.index,
-                          model,
+                          model: model.id,
                           keepOriginal: false,
                         });
                       }
@@ -2454,10 +2483,10 @@ function TakeRow({
                     value={choice}
                   >
                     {[
-                      ...VIDEO_CLONE_MODEL_IDS.map((id) => ({
-                        value: id,
-                        label: VIDEO_CLONE_MODELS[id].label,
-                        note: `$${VIDEO_CLONE_MODELS[id].usdPerSecond[provider]}/s`,
+                      ...providerInfo.models.map((model) => ({
+                        value: model.id,
+                        label: model.label,
+                        note: `$${model.usdPerSecond}/s`,
                       })),
                       // A take changes added has no original footage to keep.
                       ...(take.videoUrl
@@ -2761,7 +2790,7 @@ function TakeRow({
                                         model: take.model,
                                       },
                                     ],
-                                    provider,
+                                    providerInfo,
                                   )}
                                 </button>
                               </li>

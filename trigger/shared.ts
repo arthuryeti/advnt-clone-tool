@@ -22,9 +22,14 @@ const loaders: Record<TaskId, () => Promise<Task>> = {
 };
 
 export const tasks = {
-  /** Starts a task in this process (lib/jobs); the payload is typed by the task. */
+  /** Starts a durable Postgres-backed background task in this process. */
   trigger: async <T extends Task>(
     id: TaskId,
     payload: Parameters<T["run"]>[0],
-  ) => startRun(await loaders[id](), payload),
+    options?: {
+      organizationId?: string;
+      templateId?: string | null;
+      status?: "running" | "queued";
+    },
+  ) => startRun(await loaders[id](), payload, options),
 };

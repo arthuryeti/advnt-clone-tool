@@ -1,0 +1,215 @@
+{
+  "provider": "sume",
+  "baseUrl": "https://api.sume.com",
+  "authHeader": {
+    "name": "Authorization",
+    "prefix": "Bearer "
+  },
+  "submit": {
+    "method": "POST",
+    "path": "/v1/video-router/generate",
+    "headers": {
+      "Idempotency-Key": "22222222-2222-4222-8222-222222222222"
+    },
+    "requestBody": {
+      "model": "seedance-2.5",
+      "prompt": "@image1 holds @image2.",
+      "duration": 6,
+      "aspect_ratio": "9:16",
+      "resolution": "480p",
+      "generate_audio": true,
+      "reference_image_urls": [
+        "https://cdn.example.test/creator.jpg",
+        "https://cdn.example.test/product.jpg"
+      ],
+      "mode": "webhook",
+      "webhook_url": "https://app.example.test/api/waitpoints/00000000-0000-4000-8000-000000000020?token=test-secret"
+    },
+    "successResponse": {
+      "status": 202,
+      "body": {
+        "data": {
+          "request_id": "job_sume_123",
+          "job": {
+            "id": "job_sume_123",
+            "type": "video_generation",
+            "status": "queued"
+          },
+          "status_url": "https://api.sume.com/v1/jobs/job_sume_123/status",
+          "result_url": "https://api.sume.com/v1/jobs/job_sume_123/result",
+          "terminal": false
+        }
+      }
+    },
+    "malformedResponse": {
+      "status": 200,
+      "body": {
+        "data": {}
+      }
+    },
+    "errors": {
+      "auth": {
+        "status": 401,
+        "body": {
+          "error": {
+            "code": "INVALID_API_KEY",
+            "message": "Invalid Sume API key"
+          }
+        }
+      },
+      "quota": {
+        "status": 402,
+        "body": {
+          "error": {
+            "code": "INSUFFICIENT_CREDITS",
+            "message": "Account balance exhausted"
+          }
+        }
+      },
+      "moderation": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "SAFETY_VIOLATION",
+            "message": "Prompt failed safety check"
+          }
+        }
+      },
+      "invalidInput": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "INVALID_PARAMS",
+            "message": "Unsupported aspect ratio"
+          }
+        }
+      },
+      "rateLimited": {
+        "status": 429,
+        "headers": {
+          "Retry-After": "3"
+        },
+        "body": {
+          "error": {
+            "code": "RATE_LIMIT",
+            "message": "Slow down"
+          }
+        }
+      },
+      "transient": {
+        "status": 503,
+        "body": {
+          "error": {
+            "code": "UNAVAILABLE",
+            "message": "Router temporarily unavailable"
+          }
+        }
+      }
+    }
+  },
+  "poll": {
+    "statusPath": "/v1/jobs/job_sume_123/status",
+    "resultPath": "/v1/jobs/job_sume_123/result",
+    "pendingStatusResponse": {
+      "status": 200,
+      "body": {
+        "data": {
+          "job": {
+            "id": "job_sume_123",
+            "status": "running",
+            "error": null
+          }
+        }
+      }
+    },
+    "completedStatusResponse": {
+      "status": 200,
+      "body": {
+        "data": {
+          "job": {
+            "id": "job_sume_123",
+            "status": "completed",
+            "error": null
+          }
+        }
+      }
+    },
+    "failedStatusResponse": {
+      "status": 200,
+      "body": {
+        "data": {
+          "job": {
+            "id": "job_sume_123",
+            "status": "failed",
+            "error": {
+              "message": "Upstream worker failed"
+            }
+          }
+        }
+      }
+    },
+    "resultResponse": {
+      "status": 200,
+      "body": {
+        "data": {
+          "artifacts": [
+            {
+              "type": "video",
+              "url": "https://media.sume.example.test/renders/job_sume_123.mp4"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "webhook": {
+    "success": {
+      "event": "job.completed",
+      "job_id": "job_sume_123",
+      "payload": {
+        "artifacts": [
+          {
+            "type": "video",
+            "url": "https://media.sume.example.test/renders/job_sume_123.mp4"
+          }
+        ]
+      }
+    },
+    "failed": {
+      "event": "job.failed",
+      "job_id": "job_sume_123",
+      "error": {
+        "message": "Render failed due to safety policy"
+      }
+    },
+    "malformed": {
+      "event": "job.completed",
+      "payload": {}
+    }
+  },
+  "preflight": {
+    "method": "GET",
+    "path": "/v1/video-router/models",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "data": [
+          {
+            "id": "seedance-2.5"
+          },
+          {
+            "id": "wan-3.0"
+          }
+        ]
+      }
+    },
+    "authErrorResponse": {
+      "status": 401,
+      "body": {
+        "error": {
+          "message": "Unauthorized"
+        }
+      }
+    }
+  }
+}

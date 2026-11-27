@@ -20,6 +20,7 @@ async function handleStorageRequest(
     const range = request.headers.get("range");
     const storageResponse = await fetch(signedUrl, {
       headers: range ? { Range: range } : undefined,
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (!storageResponse.ok || !storageResponse.body) {

@@ -1,0 +1,181 @@
+{
+  "provider": "kie",
+  "baseUrl": "https://api.kie.ai",
+  "authHeader": {
+    "name": "Authorization",
+    "prefix": "Bearer "
+  },
+  "submit": {
+    "method": "POST",
+    "path": "/api/v1/jobs/createTask",
+    "requestBody": {
+      "model": "bytedance/seedance-2-5",
+      "callBackUrl": "https://app.example.test/api/waitpoints/00000000-0000-4000-8000-000000000010?token=test-secret",
+      "input": {
+        "prompt": "@image1 holds @image2.",
+        "duration": 6,
+        "aspect_ratio": "9:16",
+        "resolution": "480p",
+        "draft": true,
+        "generate_audio": true,
+        "reference_image_urls": [
+          "https://cdn.example.test/creator.jpg",
+          "https://cdn.example.test/product.jpg"
+        ]
+      }
+    },
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "code": 200,
+        "msg": "success",
+        "data": {
+          "taskId": "kie-task-123"
+        }
+      }
+    },
+    "http200Errors": {
+      "auth": {
+        "status": 200,
+        "body": {
+          "code": 401,
+          "msg": "Unauthorized: invalid Bearer token"
+        }
+      },
+      "quota": {
+        "status": 200,
+        "body": {
+          "code": 402,
+          "msg": "Insufficient credits to create task"
+        }
+      },
+      "moderation": {
+        "status": 200,
+        "body": {
+          "code": 422,
+          "msg": "Prompt rejected by safety moderation filter"
+        }
+      },
+      "invalidInput": {
+        "status": 200,
+        "body": {
+          "code": 422,
+          "msg": "duration must be between 4 and 30"
+        }
+      },
+      "rateLimited": {
+        "status": 200,
+        "body": {
+          "code": 429,
+          "msg": "Too many requests"
+        }
+      },
+      "transient": {
+        "status": 200,
+        "body": {
+          "code": 500,
+          "msg": "Upstream worker unavailable"
+        }
+      }
+    },
+    "malformedResponse": {
+      "status": 200,
+      "body": {
+        "code": 200,
+        "data": {}
+      }
+    }
+  },
+  "poll": {
+    "method": "GET",
+    "path": "/api/v1/jobs/recordInfo?taskId=kie-task-123",
+    "pendingResponse": {
+      "status": 200,
+      "body": {
+        "code": 200,
+        "msg": "success",
+        "data": {
+          "taskId": "kie-task-123",
+          "model": "bytedance/seedance-2-5",
+          "state": "generating",
+          "failCode": null,
+          "failMsg": null,
+          "resultJson": null
+        }
+      }
+    },
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "code": 200,
+        "msg": "success",
+        "data": {
+          "taskId": "kie-task-123",
+          "model": "bytedance/seedance-2-5",
+          "state": "success",
+          "failCode": null,
+          "failMsg": null,
+          "resultJson": "{\"resultUrls\":[\"https://cdn.kie.example.test/renders/kie-task-123.mp4\"]}"
+        }
+      }
+    },
+    "failedResponse": {
+      "status": 200,
+      "body": {
+        "code": 200,
+        "msg": "success",
+        "data": {
+          "taskId": "kie-task-123",
+          "model": "bytedance/seedance-2-5",
+          "state": "fail",
+          "failCode": "SAFETY_BLOCK",
+          "failMsg": "Content violated safety guidelines"
+        }
+      }
+    }
+  },
+  "webhook": {
+    "success": {
+      "code": 200,
+      "msg": "Playground task completed successfully.",
+      "data": {
+        "taskId": "kie-task-123",
+        "state": "success",
+        "resultJson": "{\"resultUrls\":[\"https://cdn.kie.example.test/renders/kie-task-123.mp4\"]}",
+        "failMsg": null
+      }
+    },
+    "failed": {
+      "code": 200,
+      "msg": "Task failed.",
+      "data": {
+        "taskId": "kie-task-123",
+        "state": "fail",
+        "resultJson": null,
+        "failMsg": "Generation failed on worker"
+      }
+    },
+    "malformed": {
+      "unexpected": "shape"
+    }
+  },
+  "preflight": {
+    "method": "GET",
+    "path": "/api/v1/chat/credit",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "code": 200,
+        "msg": "success",
+        "data": 42.5
+      }
+    },
+    "authErrorResponse": {
+      "status": 200,
+      "body": {
+        "code": 401,
+        "msg": "Invalid API key"
+      }
+    }
+  }
+}

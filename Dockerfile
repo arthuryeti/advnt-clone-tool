@@ -7,12 +7,6 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY . .
-# Public variables are compiled into the browser bundle.
-ARG NEXT_PUBLIC_SITE_URL
-ARG NEXT_PUBLIC_IMAGES_BUCKET_NAME
-ENV NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL} \
-    NEXT_PUBLIC_IMAGES_BUCKET_NAME=${NEXT_PUBLIC_IMAGES_BUCKET_NAME} \
-    SKIP_ENV_VALIDATION=true
 RUN npm run build
 
 FROM node:${NODE_VERSION} AS runner
@@ -27,5 +21,6 @@ ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/fonts ./fonts
+COPY --from=builder /app/lib/db/migrations ./lib/db/migrations
 EXPOSE 3000
 CMD ["node", "server.js"]

@@ -1,0 +1,158 @@
+{
+  "provider": "gemini",
+  "baseUrl": "https://generativelanguage.googleapis.com",
+  "authHeader": {
+    "name": "x-goog-api-key",
+    "prefix": ""
+  },
+  "generateContent": {
+    "method": "POST",
+    "path": "/v1beta/models/gemini-2.5-flash:generateContent",
+    "requestBody": {
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {
+              "inline_data": {
+                "mime_type": "video/mp4",
+                "data": "AAAA"
+              }
+            },
+            {
+              "text": "Summarize"
+            }
+          ]
+        }
+      ],
+      "generationConfig": {
+        "responseMimeType": "application/json",
+        "responseJsonSchema": {
+          "type": "object",
+          "properties": {
+            "summary": { "type": "string" }
+          },
+          "required": ["summary"]
+        }
+      }
+    },
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "candidates": [
+          {
+            "content": {
+              "role": "model",
+              "parts": [
+                {
+                  "text": "{\"summary\":\"A quick product demo\"}"
+                }
+              ]
+            },
+            "finishReason": "STOP"
+          }
+        ]
+      }
+    },
+    "safetyBlockedResponse": {
+      "status": 200,
+      "body": {
+        "promptFeedback": {
+          "blockReason": "SAFETY"
+        },
+        "candidates": [
+          {
+            "finishReason": "SAFETY"
+          }
+        ]
+      }
+    },
+    "errors": {
+      "auth": {
+        "status": 401,
+        "body": {
+          "error": {
+            "code": 401,
+            "status": "UNAUTHENTICATED",
+            "message": "API key not valid"
+          }
+        }
+      },
+      "quota": {
+        "status": 403,
+        "body": {
+          "error": {
+            "code": 403,
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "Quota exceeded for billing account"
+          }
+        }
+      },
+      "invalidInput": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": 400,
+            "status": "INVALID_ARGUMENT",
+            "message": "Invalid JSON schema in generationConfig"
+          }
+        }
+      },
+      "rateLimited": {
+        "status": 429,
+        "headers": {
+          "Retry-After": "1"
+        },
+        "body": {
+          "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "Rate limit exceeded"
+          }
+        }
+      },
+      "transient": {
+        "status": 503,
+        "body": {
+          "error": {
+            "code": 503,
+            "status": "UNAVAILABLE",
+            "message": "The model is overloaded"
+          }
+        }
+      }
+    },
+    "malformedResponse": {
+      "status": 200,
+      "body": {
+        "candidates": [
+          {
+            "content": {
+              "parts": [{ "text": "{broken" }]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "preflight": {
+    "method": "GET",
+    "path": "/v1beta/models/gemini-2.5-flash",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "name": "models/gemini-2.5-flash"
+      }
+    },
+    "authErrorResponse": {
+      "status": 400,
+      "body": {
+        "error": {
+          "code": 400,
+          "status": "INVALID_ARGUMENT",
+          "message": "API key not valid. Please pass a valid API key."
+        }
+      }
+    }
+  }
+}

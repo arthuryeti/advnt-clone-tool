@@ -1,0 +1,158 @@
+{
+  "provider": "fal",
+  "baseUrl": "https://queue.fal.run",
+  "preflightBaseUrl": "https://api.fal.ai",
+  "authHeader": {
+    "name": "Authorization",
+    "prefix": "Key "
+  },
+  "submit": {
+    "method": "POST",
+    "path": "/fal-ai/seedance-2.5",
+    "queryParamWebhook": "fal_webhook",
+    "requestBody": {
+      "prompt": "@img1 holds @img2.",
+      "duration": "6s",
+      "aspect_ratio": "9:16",
+      "resolution": "480p",
+      "generate_audio": true,
+      "image_urls": [
+        "https://cdn.example.test/creator.jpg",
+        "https://cdn.example.test/product.jpg"
+      ]
+    },
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "status": "IN_QUEUE",
+        "request_id": "fal-req-123",
+        "response_url": "https://queue.fal.run/fal-ai/seedance-2.5/requests/fal-req-123",
+        "status_url": "https://queue.fal.run/fal-ai/seedance-2.5/requests/fal-req-123/status",
+        "cancel_url": "https://queue.fal.run/fal-ai/seedance-2.5/requests/fal-req-123/cancel"
+      }
+    },
+    "errors": {
+      "auth": {
+        "status": 401,
+        "body": {
+          "detail": "Invalid API Key"
+        }
+      },
+      "quota": {
+        "status": 402,
+        "body": {
+          "detail": "Exhausted balance"
+        }
+      },
+      "moderation": {
+        "status": 422,
+        "body": {
+          "detail": "NSFW content policy violation"
+        }
+      },
+      "invalidInput": {
+        "status": 422,
+        "body": {
+          "detail": "duration is invalid"
+        }
+      },
+      "rateLimited": {
+        "status": 429,
+        "headers": {
+          "Retry-After": "2"
+        },
+        "body": {
+          "detail": "Too many requests"
+        }
+      },
+      "transient": {
+        "status": 503,
+        "body": {
+          "detail": "Queue unavailable"
+        }
+      }
+    },
+    "malformedResponse": {
+      "status": 200,
+      "body": {
+        "status": "IN_QUEUE"
+      }
+    }
+  },
+  "poll": {
+    "statusPath": "/fal-ai/seedance-2.5/requests/fal-req-123/status",
+    "responsePath": "/fal-ai/seedance-2.5/requests/fal-req-123",
+    "pendingStatusResponse": {
+      "status": 200,
+      "body": {
+        "status": "IN_PROGRESS",
+        "request_id": "fal-req-123",
+        "response_url": "https://queue.fal.run/fal-ai/seedance-2.5/requests/fal-req-123",
+        "status_url": "https://queue.fal.run/fal-ai/seedance-2.5/requests/fal-req-123/status"
+      }
+    },
+    "completedStatusResponse": {
+      "status": 200,
+      "body": {
+        "status": "COMPLETED",
+        "request_id": "fal-req-123",
+        "response_url": "https://queue.fal.run/fal-ai/seedance-2.5/requests/fal-req-123",
+        "status_url": "https://queue.fal.run/fal-ai/seedance-2.5/requests/fal-req-123/status"
+      }
+    },
+    "failedStatusResponse": {
+      "status": 200,
+      "body": {
+        "status": "FAILED",
+        "request_id": "fal-req-123",
+        "error": "Model worker failed"
+      }
+    },
+    "resultResponse": {
+      "status": 200,
+      "body": {
+        "video": {
+          "url": "https://v3.fal.media.example.test/files/fal-req-123.mp4",
+          "content_type": "video/mp4"
+        }
+      }
+    }
+  },
+  "webhook": {
+    "success": {
+      "request_id": "fal-req-123",
+      "status": "OK",
+      "payload": {
+        "video": {
+          "url": "https://v3.fal.media.example.test/files/fal-req-123.mp4",
+          "content_type": "video/mp4"
+        }
+      }
+    },
+    "failed": {
+      "request_id": "fal-req-123",
+      "status": "ERROR",
+      "error": "Out of memory on GPU worker"
+    },
+    "malformed": {
+      "request_id": "fal-req-123",
+      "status": "OK"
+    }
+  },
+  "preflight": {
+    "method": "GET",
+    "path": "/v1/models?limit=1",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "models": []
+      }
+    },
+    "authErrorResponse": {
+      "status": 401,
+      "body": {
+        "detail": "Invalid Key"
+      }
+    }
+  }
+}

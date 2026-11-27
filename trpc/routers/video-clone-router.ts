@@ -1,6 +1,7 @@
 import { TRPCError } from "@trpc/server";
 import { z } from "zod/v4";
 import { reviseVideoCloneTakePrompt } from "@/lib/ai/adapt-video-clone-prompts";
+import { getPublicVideoProviderInfo } from "@/lib/ai/video-provider";
 import {
   generateVideoCloneInputSchema,
   MAX_VIDEO_CLONE_PRODUCTS,
@@ -25,8 +26,8 @@ import {
   updateVideoCloneTake,
 } from "@/lib/content-workflows/video-clone-store";
 import { WORKSPACE_ID } from "@/lib/db";
-import { env } from "@/lib/env";
 import { listRuns } from "@/lib/jobs";
+import { runPreflight } from "@/lib/preflight";
 import { getErrorMessage } from "@/lib/utils";
 import { triggerTaskIds } from "@/trigger/shared";
 import { createTRPCRouter, publicProcedure } from "@/trpc/init";
@@ -41,9 +42,10 @@ export const videoCloneRouter = createTRPCRouter({
   /** The workspace's clone plans, newest first. */
   list: publicProcedure.query(() => listVideoClones(WORKSPACE_ID)),
 
-  /** Analyses started since this server started: running, failed, or done (with the plan's id). */
-  runs: publicProcedure.query(() =>
-    listRuns(triggerTaskIds.analyzeVideoClone).map((run) => {
+  /** Durable analysis runs from Postgres: running, failed, or done (with the plan's id). */
+  runs: publicProcedure.query(async () => {
+    const rows = await listRuns(triggerTaskIds.analyzeVideoClone);
+    return rows.map((run) => {
       const payload = run.payload as { name: string; sourceUrl: string };
       const progress = run.metadata.videoClone as
         | { label: string; progress: number }
@@ -59,7 +61,12 @@ export const videoCloneRouter = createTRPCRouter({
         error: run.error ?? null,
         templateId: output?.templateId ?? null,
       };
-    }),
+    });
+  }),
+
+  /** Non-billable doctor/preflight check across configured providers, storage, and binaries. */
+  preflight: publicProcedure.query(() =>
+    runPreflight({ scope: "all", force: true }),
   ),
 
   /** A presigned upload for a source video (uploadVideoFile). */
@@ -96,8 +103,8 @@ export const videoCloneRouter = createTRPCRouter({
       }
     }),
 
-  /** Who renders takes (VIDEO_PROVIDER). */
-  provider: publicProcedure.query(() => ({ provider: env.VIDEO_PROVIDER })),
+  /** Active video provider capabilities, models, and per-second rates declared by the plugin. */
+  provider: publicProcedure.query(() => getPublicVideoProviderInfo()),
 
   get: publicProcedure
     .input(z.object({ id: z.string().uuid() }))
@@ -149,7 +156,7 @@ export const videoCloneRouter = createTRPCRouter({
       return result.take;
     }),
 
-  /** Puts a finished render back in the edit: a take render for the whole take, or for one shot any of its take's renders or its own. */
+  /** Puts a finished render back in the edit. */
   pickRender: publicProcedure
     .input(
       videoCloneTakeEditSchema
@@ -165,11 +172,7 @@ export const videoCloneRouter = createTRPCRouter({
       return result;
     }),
 
-  /**
-   * Saves a take's edited lines: each goes where the prompt quotes the old one
-   * (sayVideoCloneLines); only a cut line or a prompt that doesn't quote it needs Opus to
-   * rewrite the prompt to speak them.
-   */
+  /** Saves a take's edited lines, invoking the text provider only if needed. */
   reviseTake: publicProcedure
     .input(
       videoCloneTakeEditSchema
@@ -205,10 +208,7 @@ export const videoCloneRouter = createTRPCRouter({
       return result.take;
     }),
 
-  /**
-   * Starts applying the toolbar's change in the background (rewrite-video-clone): the look, the
-   * lines, the timing, and takes it adds to grow the script. `get`'s `rewrite` follows it.
-   */
+  /** Starts applying the toolbar's change in the background (rewrite-video-clone). */
   applyChanges: publicProcedure
     .input(
       rewriteVideoCloneInputSchema.omit({
@@ -265,7 +265,7 @@ export const videoCloneRouter = createTRPCRouter({
       return { success: true };
     }),
 
-  /** Renders takes on the video provider; each take's status shows up in `get` as it lands. */
+  /** Renders takes on the active video provider; each take's status shows up in `get`. */
   generate: publicProcedure
     .input(
       generateVideoCloneInputSchema.omit({

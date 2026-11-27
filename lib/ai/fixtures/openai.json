@@ -1,0 +1,103 @@
+{
+  "provider": "openai",
+  "baseUrl": "https://api.openai.com/v1",
+  "authHeader": {
+    "name": "Authorization",
+    "prefix": "Bearer "
+  },
+  "chatCompletions": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "id": "chatcmpl-oa-123",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "{\"summary\":\"A quick product demo\"}"
+            },
+            "finish_reason": "stop"
+          }
+        ]
+      }
+    },
+    "errors": {
+      "auth": {
+        "status": 401,
+        "body": {
+          "error": {
+            "code": "invalid_api_key",
+            "message": "Incorrect API key provided"
+          }
+        }
+      },
+      "quota": {
+        "status": 429,
+        "body": {
+          "error": {
+            "code": "insufficient_quota",
+            "message": "You exceeded your current quota, please check your plan and billing details"
+          }
+        }
+      },
+      "moderation": {
+        "status": 400,
+        "body": {
+          "error": {
+            "code": "content_policy_violation",
+            "message": "Your request was rejected as a result of our safety system"
+          }
+        }
+      },
+      "rateLimited": {
+        "status": 429,
+        "headers": {
+          "Retry-After": "1"
+        },
+        "body": {
+          "error": {
+            "code": "rate_limit_exceeded",
+            "message": "Rate limit reached for requests"
+          }
+        }
+      },
+      "transient": {
+        "status": 500,
+        "body": {
+          "error": {
+            "code": "server_error",
+            "message": "The server had an error while processing your request"
+          }
+        }
+      }
+    },
+    "malformedResponse": {
+      "status": 200,
+      "body": {
+        "choices": []
+      }
+    }
+  },
+  "preflight": {
+    "method": "GET",
+    "path": "/v1/models",
+    "successResponse": {
+      "status": 200,
+      "body": {
+        "data": [{ "id": "gpt-4.1" }]
+      }
+    },
+    "authErrorResponse": {
+      "status": 401,
+      "body": {
+        "error": {
+          "code": "invalid_api_key",
+          "message": "Incorrect API key provided"
+        }
+      }
+    }
+  }
+}
